@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NextCue Meeting Companion</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">N</div>
+      <h1>Keep NextCue close.</h1>
+      <p>Let your desktop assistant know when you open a supported meeting page. You choose what happens next in NextCue Settings.</p>
+      <form id="setup">
+        <label for="connection">Connection code</label>
+        <p class="hint">In NextCue, open Settings → Background &amp; meetings, then copy the browser connection code.</p>
+        <textarea id="connection" placeholder='{"port":12345,"token":"…"}' spellcheck="false" autocomplete="off" rows="3"></textarea>
+        <p id="paired" class="hint"></p>
+        <label class="toggle"><input id="enabled" type="checkbox"> Enable meeting-page hints in this browser</label>
+        <div class="buttons"><button type="submit">Save connection</button><button id="check" type="button" class="secondary">Check open meeting pages</button></div>
+      </form>
+      <p id="status" role="status" aria-live="polite"></p>
+      <p class="privacy">Only the provider name and a random page ID go to NextCue on this computer. URLs, meeting codes, page contents, audio, and screenshots stay out of the connection. A meeting page can be open before a call starts.</p>
+      <button id="remove" type="button" class="remove">Remove connection</button>
+    </main>
+    <script src="routes.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -1,6 +1,34 @@
 export type SessionMode = "Interview" | "Practice" | "Meeting";
 export type SessionStatus = "ready" | "active" | "ended";
 export type AnswerProvider = "local" | "chatgpt" | "claude";
+export type AssistanceMode = "manual" | "notes" | "answers";
+export type MeetingAction = "none" | "prompt" | "listen-notes" | "listen-answer";
+export interface BackgroundConfiguration {
+  runInBackground: boolean;
+  startHidden: boolean;
+  meetingDetection: boolean;
+  meetingAction: MeetingAction;
+}
+export interface BackgroundStatus extends BackgroundConfiguration {
+  trayAvailable: boolean;
+  detectionAvailable: boolean;
+  detail?: string;
+}
+export interface BackgroundAction {
+  action: "show" | "settings" | "meeting-trigger" | "listen" | "notes" | "answers" | "pause";
+  source: "tray" | "shortcut" | "dock";
+}
+export interface MeetingHint {
+  app: string;
+  detail?: string;
+  kind?: "desktop-app" | "browser-page";
+}
+export interface BrowserConnection {
+  available: boolean;
+  port?: number;
+  token?: string;
+  detail?: string;
+}
 export interface TranscriptEntry {
   id: string;
   text: string;
@@ -29,6 +57,7 @@ export interface InterviewSession {
   transcript: TranscriptEntry[];
   answers: Answer[];
   summary?: string;
+  assistanceMode?: AssistanceMode;
 }
 export interface Settings {
   model: string;
@@ -43,6 +72,11 @@ export interface Settings {
   answerProvider?: AnswerProvider;
   chatgptModel?: string;
   jevEnabled?: boolean;
+  runInBackground?: boolean;
+  startHidden?: boolean;
+  meetingDetection?: boolean;
+  meetingAction?: MeetingAction;
+  meetingShortcut?: string;
 }
 export interface AppState {
   sessions: InterviewSession[];
@@ -124,6 +158,7 @@ export interface CompanionConfiguration {
   captureProtection: boolean;
   answerShortcut: string;
   visibilityShortcut: string;
+  meetingShortcut?: string;
 }
 export interface CompanionState {
   mode: CompanionMode;
@@ -135,6 +170,8 @@ export interface CompanionState {
   answerShortcut?: string;
   visibilityShortcut?: string;
   captureProtectionEnabled?: boolean;
+  meetingShortcut?: string;
+  meetingShortcutAvailable?: boolean;
 }
 export interface DesktopAPI {
   getState(): Promise<AppState>;
@@ -185,6 +222,14 @@ export interface DesktopAPI {
   getCompanionStatus?(): Promise<CompanionState>;
   setCompanionVisible?(visible: boolean): Promise<CompanionState>;
   onCompanionVisibility?(callback: (visible: boolean) => void): () => void;
+  configureBackground?(configuration: BackgroundConfiguration): Promise<BackgroundStatus>;
+  getBackgroundStatus?(): Promise<BackgroundStatus>;
+  onBackgroundAction?(callback: (event: BackgroundAction) => void): () => void;
+  onMeetingHint?(callback: (event: MeetingHint) => void): () => void;
+  backgroundReady?(): Promise<void>;
+  getBrowserConnection?(): Promise<BrowserConnection>;
+  openBrowserCompanion?(): Promise<void>;
+  updateBackgroundActivity?(activity: { listening: boolean; mode: AssistanceMode }): Promise<void>;
   minimize(): void;
   onBeforeQuit(callback: () => void): () => void;
   quitApp(state: AppState | null): Promise<void>;

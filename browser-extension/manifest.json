@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "NextCue Meeting Companion",
+  "version": "0.1.0",
+  "description": "Optional meeting-page hints for the NextCue desktop assistant. No page content or meeting URL leaves the browser.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://meet.google.com/*",
+    "https://zoom.us/*",
+    "https://*.zoom.us/*",
+    "https://zoomgov.com/*",
+    "https://*.zoomgov.com/*",
+    "https://teams.microsoft.com/*",
+    "https://teams.live.com/*",
+    "https://teams.cloud.microsoft/*",
+    "https://*.webex.com/*",
+    "https://meet.jit.si/*",
+    "https://whereby.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Set up NextCue meeting hints" },
+  "options_page": "options.html",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src http://127.0.0.1:*"
+  }
+}

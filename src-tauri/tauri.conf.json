@@ -14,6 +14,7 @@
     "windows": [
       {
         "title": "NextCue",
+        "visible": false,
         "width": 1160,
         "height": 780,
         "minWidth": 860,
@@ -32,6 +33,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../browser-extension/": "browser-companion/"
+    },
     "category": "Productivity",
     "shortDescription": "Your desktop assistant for conversations and preparation.",
     "macOS": {

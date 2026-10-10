@@ -10,6 +10,7 @@ import {
   ArrowLeft,
   ArrowRight,
   AudioLines,
+  Bell,
   BookOpen,
   Check,
   CheckCircle2,
@@ -39,6 +40,7 @@ import {
   Search,
   Send,
   Settings2,
+  Monitor,
   ShieldCheck,
   Sparkles,
   Square,
@@ -63,6 +65,12 @@ import type {
   ChatgptStatus,
   ClaudeStatus,
   ChatRequest,
+  AssistanceMode,
+  BackgroundAction,
+  BackgroundConfiguration,
+  BackgroundStatus,
+  BrowserConnection,
+  MeetingHint,
 } from "./types";
 
 const uid = () => crypto.randomUUID();
@@ -187,6 +195,7 @@ function Modal({
 export default function App() {
   const [state, setState] = useState<AppState>(defaults);
   const [loaded, setLoaded] = useState(false);
+  const [initialChecksComplete, setInitialChecksComplete] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeStatus>({
     ollama: false,
     models: [],
@@ -227,6 +236,7 @@ export default function App() {
   >(null);
   const [listening, setListening] = useState(false);
   const [audioBusy, setAudioBusy] = useState(false);
+  const audioOperationRef = useRef(false);
   const [voiceSetup, setVoiceSetup] = useState(false);
   const [voiceProgress, setVoiceProgress] = useState({
     progress: 0,
@@ -245,9 +255,29 @@ export default function App() {
   const [shortcutDraft, setShortcutDraft] = useState({
     answerShortcut: defaults.settings.answerShortcut!,
     visibilityShortcut: defaults.settings.visibilityShortcut!,
+    meetingShortcut: defaults.settings.meetingShortcut!,
   });
   const [shortcutSaving, setShortcutSaving] = useState(false);
   const [shortcutError, setShortcutError] = useState("");
+  const [background, setBackground] = useState<BackgroundStatus>({
+    runInBackground: true,
+    startHidden: false,
+    meetingDetection: false,
+    meetingAction: "none",
+    trayAvailable: false,
+    detectionAvailable: false,
+  });
+  const [backgroundSaving, setBackgroundSaving] = useState(false);
+  const [backgroundError, setBackgroundError] = useState("");
+  const [meetingHint, setMeetingHint] = useState<MeetingHint | null>(null);
+  const [browserConnection, setBrowserConnection] = useState<BrowserConnection | null>(null);
+  const [browserBusy, setBrowserBusy] = useState(false);
+  const backgroundSavingRef = useRef(false);
+  const backgroundQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const backgroundHandlerRef = useRef<(event: BackgroundAction) => Promise<void>>(async () => {});
+  const meetingHintHandlerRef = useRef<(event: MeetingHint) => Promise<void>>(async () => {});
+  const pendingMeetingHintRef = useRef<MeetingHint | null>(null);
+  const notesWatermarkRef = useRef<Record<string, number>>({});
   const companionBusyRef = useRef(false);
   const [detailsTab, setDetailsTab] = useState<"transcript" | "context" | null>(
     null,
@@ -297,6 +327,12 @@ export default function App() {
     }));
   const updateSettings = (patch: Partial<Settings>) =>
     setState((s) => ({ ...s, settings: { ...s.settings, ...patch } }));
+  const autoAnswersEnabled = (sessionId: string) => {
+    const session = stateRef.current.sessions.find((s) => s.id === sessionId);
+    return session?.assistanceMode === "answers" ||
+      (session?.assistanceMode !== "notes" && session?.assistanceMode !== "manual" &&
+        stateRef.current.settings.autoAnswer);
+  };
 
   function acceptChatgpt(result: ChatgptStatus) {
     setChatgpt(result);
@@ -413,8 +449,9 @@ export default function App() {
           setLoaded(true);
         })
         .catch((e) => notify(`Could not load local data: ${errorText(e)}`));
-      void refresh();
-      void refreshProviders();
+      void Promise.all([refresh(), refreshProviders()]).then(() =>
+        setInitialChecksComplete(true),
+      );
       api
         .getJevStatus?.()
         .then((result) => setJevConfigured(result.configured))
@@ -558,7 +595,7 @@ export default function App() {
               ? "default"
               : stateRef.current.settings.model,
         provider,
-        sessionMode: session.mode,
+        sessionMode: kind === "summary" && session.assistanceMode === "notes" ? "Meeting" : session.mode,
         sessionTitle: session.title,
         role: session.role,
         company: session.company,
@@ -614,9 +651,10 @@ export default function App() {
       if (requestRef.current?.id !== id) return;
       const result = await api.chat(request);
       if (requestRef.current?.id !== id) return;
-      if (kind === "summary")
+      if (kind === "summary") {
+        notesWatermarkRef.current[session.id] = session.transcript.length;
         updateSession(session.id, (s) => ({ ...s, summary: result.text }));
-      else
+      } else
         updateSession(session.id, (s) => ({
           ...s,
           answers: [
@@ -643,7 +681,7 @@ export default function App() {
           pending &&
           listeningRef.current &&
           selectedRef.current === pending.sessionId &&
-          stateRef.current.settings.autoAnswer
+          autoAnswersEnabled(pending.sessionId)
         ) {
           pendingAutoQuestion.current = null;
           clearTimeout(autoTimer.current);
@@ -657,6 +695,20 @@ export default function App() {
   }
   const generateRef = useRef(generate);
   generateRef.current = generate;
+  useEffect(() => {
+    if (!loaded) return;
+    const timer = setInterval(() => {
+      const session = stateRef.current.sessions.find((s) => s.id === selectedRef.current);
+      if (
+        session?.assistanceMode === "notes" &&
+        session.status === "active" &&
+        listeningRef.current &&
+        !requestRef.current &&
+        session.transcript.length > (notesWatermarkRef.current[session.id] || 0)
+      ) void generateRef.current("Create meeting notes.", "summary");
+    }, 60000);
+    return () => clearInterval(timer);
+  }, [loaded]);
   useEffect(() => {
     const unToken = api.onToken((event) => {
       if (requestRef.current?.id === event.requestId)
@@ -678,7 +730,7 @@ export default function App() {
         transcript: [...s.transcript, { id: uid(), ...event }],
       }));
       if (
-        stateRef.current.settings.autoAnswer &&
+        autoAnswersEnabled(event.sessionId) &&
         /\?|\b(tell me|walk me|explain|describe|how would|how do|what is|what are|why do|can you)\b/i.test(
           event.text,
         )
@@ -695,7 +747,7 @@ export default function App() {
             !requestRef.current &&
             selectedRef.current === pending.sessionId &&
             listeningRef.current &&
-            stateRef.current.settings.autoAnswer
+            autoAnswersEnabled(pending.sessionId)
           ) {
             pendingAutoQuestion.current = null;
             void generateRef.current(pending.text);
@@ -770,6 +822,7 @@ export default function App() {
     if (request) await api.cancelChat(request.id).catch(() => {});
   }
   async function stopAudio() {
+    audioOperationRef.current = true;
     setAudioBusy(true);
     listeningRef.current = false;
     setListening(false);
@@ -781,6 +834,7 @@ export default function App() {
       notify(errorText(e));
     } finally {
       acceptingTranscriptRef.current = null;
+      audioOperationRef.current = false;
       setAudioBusy(false);
     }
   }
@@ -801,37 +855,171 @@ export default function App() {
     await navigate("live", session.id);
   }
   async function toggleAudio() {
-    if (audioBusy) return;
-    if (listening) {
+    if (audioOperationRef.current) return;
+    if (listeningRef.current) {
       await stopAudio();
       return;
     }
     if (!selected) return;
+    await startAudio(selected.id);
+  }
+  async function startAudio(sessionId: string) {
+    if (audioOperationRef.current || listeningRef.current) return;
     if (!runtime.transcription) {
       notify("Set up local transcription in Settings first.");
-      if (companion.mode !== "main") await setCompanionMode("main");
-      setView("settings");
+      setBackgroundError("Set up local transcription in Settings before starting background listening.");
+      await showWorkspace(true);
       return;
     }
+    audioOperationRef.current = true;
     setAudioBusy(true);
     try {
-      acceptingTranscriptRef.current = selected.id;
+      acceptingTranscriptRef.current = sessionId;
       await api.startListening({
-        device: state.settings.inputDevice,
-        language: state.settings.language,
-        sessionId: selected.id,
-        source: state.settings.audioSource,
+        device: stateRef.current.settings.inputDevice,
+        language: stateRef.current.settings.language,
+        sessionId,
+        source: stateRef.current.settings.audioSource,
       });
       listeningRef.current = true;
       setListening(true);
-      if (selected.status === "ready")
-        updateSession(selected.id, (s) => ({ ...s, status: "active" }));
+      updateSession(sessionId, (s) => s.status === "ready" ? { ...s, status: "active" } : s);
     } catch (e) {
       acceptingTranscriptRef.current = null;
+      setBackgroundError(errorText(e));
       notify(errorText(e));
     } finally {
+      audioOperationRef.current = false;
       setAudioBusy(false);
     }
+  }
+
+  async function showWorkspace(settings = false) {
+    if (api.setCompanionMode) setCompanion(await api.setCompanionMode("main"));
+    if (api.setCompanionVisible) setCompanion(await api.setCompanionVisible(true));
+    setModal(null);
+    setView(settings ? "settings" : selectedRef.current ? "live" : "workspace");
+  }
+  async function startBackgroundAssistance(mode: AssistanceMode) {
+    if (!loadedRef.current) return;
+    let session = stateRef.current.sessions.find((s) => s.id === selectedRef.current && s.status !== "ended");
+    if (mode === "notes" && !listeningRef.current && session?.mode !== "Meeting")
+      session = undefined;
+    if (!session) {
+      session = {
+        id: uid(), title: "Meeting " + new Date().toLocaleDateString(),
+        company: "", role: "", mode: "Meeting", createdAt: Date.now(),
+        status: "ready", duration: 0, context: "", instructions: "",
+        transcript: [], answers: [], assistanceMode: mode,
+      };
+      const next = { ...stateRef.current, sessions: [session, ...stateRef.current.sessions] };
+      stateRef.current = next;
+      setState(next);
+      selectedRef.current = session.id;
+      setSelectedId(session.id);
+    } else {
+      const next = {
+        ...stateRef.current,
+        sessions: stateRef.current.sessions.map((s) => s.id === session!.id ? { ...s, assistanceMode: mode } : s),
+      };
+      stateRef.current = next;
+      setState(next);
+    }
+    pendingAutoQuestion.current = null;
+    clearTimeout(autoTimer.current);
+    pendingMeetingHintRef.current = null;
+    setMeetingHint(null);
+    setModal(null);
+    setView("live");
+    if (mode === "notes") setAnswerTab("summary");
+    else setAnswerTab("answer");
+    await startAudio(session.id);
+    if (mode === "notes" && session.transcript.length && !requestRef.current)
+      void generateRef.current("Create meeting notes.", "summary");
+  }
+  async function applyMeetingTrigger(hint?: MeetingHint) {
+    const action = stateRef.current.settings.meetingAction || "none";
+    if (action === "none") return;
+    if (action === "prompt") {
+      if (pendingMeetingHintRef.current) return;
+      const pending = hint || { app: "Meeting trigger", detail: "Choose how NextCue can help." };
+      pendingMeetingHintRef.current = pending;
+      setMeetingHint(pending);
+      await showWorkspace();
+    } else await startBackgroundAssistance(action === "listen-notes" ? "notes" : "answers");
+  }
+  backgroundHandlerRef.current = async (event) => {
+    if (!loadedRef.current) return;
+    if (event.action === "show") await showWorkspace();
+    else if (event.action === "settings") await showWorkspace(true);
+    else if (event.action === "pause") {
+      await stopAudio();
+      // The final transcription event and React update may arrive in the same
+      // turn as stopListening's reply. Let that update settle before the recap.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const session = stateRef.current.sessions.find((s) => s.id === selectedRef.current);
+      if (session?.assistanceMode === "notes" && !requestRef.current &&
+        session.transcript.length > (notesWatermarkRef.current[session.id] || 0))
+        void generateRef.current("Create meeting notes.", "summary");
+    }
+    else if (event.action === "meeting-trigger") await applyMeetingTrigger();
+    else await startBackgroundAssistance(event.action === "notes" ? "notes" : event.action === "answers" ? "answers" : "manual");
+  };
+  meetingHintHandlerRef.current = async (hint) => {
+    if (!loadedRef.current || !stateRef.current.settings.meetingDetection || listeningRef.current) return;
+    await applyMeetingTrigger(hint);
+  };
+  useEffect(() => {
+    const enqueue = (operation: () => Promise<void>) => {
+      backgroundQueueRef.current = backgroundQueueRef.current.then(operation).catch((e) => notify(errorText(e)));
+    };
+    const offAction = api.onBackgroundAction?.((event) => enqueue(() => backgroundHandlerRef.current(event)));
+    const offHint = api.onMeetingHint?.((event) => enqueue(() => meetingHintHandlerRef.current(event)));
+    return () => { offAction?.(); offHint?.(); };
+  }, []);
+  useEffect(() => {
+    if (!loaded || !initialChecksComplete) return;
+    const config: BackgroundConfiguration = {
+      runInBackground: stateRef.current.settings.runInBackground !== false,
+      startHidden: stateRef.current.settings.startHidden === true,
+      meetingDetection: stateRef.current.settings.meetingDetection === true,
+      meetingAction: stateRef.current.settings.meetingAction || "none",
+    };
+    void (async () => {
+      try {
+        if (api.configureBackground) setBackground(await api.configureBackground(config));
+        if (api.getCompanionStatus) setCompanion(await api.getCompanionStatus());
+        await api.backgroundReady?.();
+      } catch (e) { setBackgroundError(errorText(e)); }
+    })();
+  }, [loaded, initialChecksComplete]);
+  useEffect(() => {
+    if (loaded) void api.updateBackgroundActivity?.({ listening, mode: selected?.assistanceMode || "manual" }).catch(() => {});
+  }, [loaded, listening, selected?.assistanceMode]);
+  useEffect(() => {
+    if (view !== "settings" || companion.visible === false) setBrowserConnection(null);
+  }, [view, companion.visible]);
+  async function saveBackgroundSettings(patch: Partial<BackgroundConfiguration>) {
+    if (!api.configureBackground || backgroundSavingRef.current) return;
+    backgroundSavingRef.current = true;
+    setBackgroundSaving(true);
+    setBackgroundError("");
+    const config: BackgroundConfiguration = {
+      runInBackground: state.settings.runInBackground !== false,
+      startHidden: state.settings.startHidden === true,
+      meetingDetection: state.settings.meetingDetection === true,
+      meetingAction: state.settings.meetingAction || "none",
+      ...patch,
+    };
+    try {
+      const accepted = await api.configureBackground(config);
+      setBackground(accepted);
+      updateSettings({
+        runInBackground: accepted.runInBackground, startHidden: accepted.startHidden,
+        meetingDetection: accepted.meetingDetection, meetingAction: accepted.meetingAction,
+      });
+    } catch (e) { setBackgroundError(errorText(e)); }
+    finally { backgroundSavingRef.current = false; setBackgroundSaving(false); }
   }
   async function endSession() {
     if (!selected) return;
@@ -1045,10 +1233,13 @@ export default function App() {
       visibilityShortcut:
         stateRef.current.settings.visibilityShortcut ||
         defaults.settings.visibilityShortcut!,
+      meetingShortcut:
+        stateRef.current.settings.meetingShortcut || defaults.settings.meetingShortcut!,
     };
     setShortcutDraft({
       answerShortcut: configuration.answerShortcut,
       visibilityShortcut: configuration.visibilityShortcut,
+      meetingShortcut: configuration.meetingShortcut!,
     });
     if (api.configureCompanion)
       void api
@@ -1067,6 +1258,7 @@ export default function App() {
                 visibilityShortcut:
                   accepted.visibilityShortcut ||
                   defaults.settings.visibilityShortcut!,
+                meetingShortcut: accepted.meetingShortcut || defaults.settings.meetingShortcut!,
               });
             } catch {
               // The failure stays visible in Settings; hiding is guarded natively.
@@ -1092,6 +1284,7 @@ export default function App() {
       visibilityShortcut:
         state.settings.visibilityShortcut ||
         defaults.settings.visibilityShortcut!,
+      meetingShortcut: state.settings.meetingShortcut || defaults.settings.meetingShortcut!,
       ...patch,
     };
     try {
@@ -1107,15 +1300,18 @@ export default function App() {
           result.visibilityShortcut ||
           configuration.visibilityShortcut ||
           defaults.settings.visibilityShortcut!,
+        meetingShortcut: result.meetingShortcut || configuration.meetingShortcut || defaults.settings.meetingShortcut!,
       };
       updateSettings(saved);
       if (
         patch.answerShortcut !== undefined ||
-        patch.visibilityShortcut !== undefined
+        patch.visibilityShortcut !== undefined ||
+        patch.meetingShortcut !== undefined
       )
         setShortcutDraft({
           answerShortcut: saved.answerShortcut,
           visibilityShortcut: saved.visibilityShortcut,
+          meetingShortcut: saved.meetingShortcut,
         });
       notify("Assistant settings saved.");
     } catch (e) {
@@ -1380,7 +1576,7 @@ export default function App() {
                 className="icon-button"
                 aria-label="Hide assistant"
                 title={"Hide assistant · " + visibilityShortcut}
-                disabled={companion.visibilityShortcutAvailable === false}
+                disabled={companion.visibilityShortcutAvailable === false && !background.trayAvailable}
                 onClick={() => void hideAssistant()}
               >
                 <EyeOff size={15} />
@@ -1568,6 +1764,31 @@ export default function App() {
             </button>
           </div>
         </header>
+        {meetingHint && (
+          <section className="meeting-trigger-prompt" aria-label="Meeting detected">
+            <Bell size={20} />
+            <div>
+              <strong>{meetingHint.app} is ready. How can NextCue help?</strong>
+              <p>{meetingHint.detail || "A meeting hint is available. Choose an action when you are ready."}</p>
+            </div>
+            <div className="meeting-trigger-actions">
+              {([
+                ["manual", "Start listening"], ["notes", "Take notes"], ["answers", "Answer questions"],
+              ] as const).map(([mode, label]) => (
+                <button key={mode} className="button secondary small-button" disabled={audioBusy}
+                  onClick={() => {
+                    backgroundQueueRef.current = backgroundQueueRef.current
+                      .then(() => startBackgroundAssistance(mode))
+                      .catch((e) => notify(errorText(e)));
+                  }}>{label}</button>
+              ))}
+              <button className="icon-button" aria-label="Dismiss meeting hint" onClick={() => {
+                pendingMeetingHintRef.current = null;
+                setMeetingHint(null);
+              }}><X size={16} /></button>
+            </div>
+          </section>
+        )}
         {!loaded ? (
           <div className="loading-state">
             <Loader2 className="spin" />
@@ -2177,6 +2398,107 @@ export default function App() {
                   )}
                 </details>
               </section>
+              <section className="panel settings-panel full background-settings">
+                <div className="panel-title">
+                  <Monitor size={21} />
+                  <div>
+                    <h2>Background & meetings</h2>
+                    <p>Keep NextCue ready in your system tray. Choose what a meeting trigger does.</p>
+                  </div>
+                </div>
+                {([
+                  ["runInBackground", "Keep running in system tray", "Closing the window keeps your session running. Quit NextCue from the tray menu to exit."],
+                  ["startHidden", "Start in system tray", "Open quietly in the tray when you launch NextCue. Launching never starts listening by itself."],
+                  ["meetingDetection", "Detect meeting hints", "Look for newly opened Zoom or Teams desktop apps and meeting pages reported by the browser companion."],
+                ] as const).map(([key, label, description]) => (
+                  <div className="preference-row" key={key}>
+                    <div><strong>{label}</strong><p>{description}</p></div>
+                    <button
+                      className={"toggle " + (state.settings[key] ? "on" : "")}
+                      role="switch"
+                      aria-label={label}
+                      aria-checked={state.settings[key] === true}
+                      disabled={backgroundSaving || !api.configureBackground}
+                      onClick={() => void saveBackgroundSettings({ [key]: !state.settings[key] })}
+                    ><span /></button>
+                  </div>
+                ))}
+                <label className="meeting-action-field">
+                  <span>When a meeting is triggered</span>
+                  <select
+                    aria-label="When a meeting is triggered"
+                    value={state.settings.meetingAction || "none"}
+                    disabled={backgroundSaving || !api.configureBackground}
+                    onChange={(event) => void saveBackgroundSettings({ meetingAction: event.target.value as BackgroundConfiguration["meetingAction"] })}
+                  >
+                    <option value="none">Do nothing</option>
+                    <option value="prompt">Ask me first</option>
+                    <option value="listen-notes">Listen and take notes</option>
+                    <option value="listen-answer">Listen and answer</option>
+                  </select>
+                </label>
+                <p className="helper-line">
+                  This applies to the meeting shortcut and detected hints. Explicit tray actions work whenever you choose them.
+                  App or page presence is a hint, not proof that a call has started. Listening continues until you pause it.
+                </p>
+                {state.settings.meetingAction?.startsWith("listen-") && (
+                  <p className="background-status">
+                    Listening starts automatically only for opted-in hints, or when you run the meeting trigger.
+                    Use listening when meeting participants agree. Notes and answers use your selected AI provider.
+                  </p>
+                )}
+                <details className="browser-connection">
+                  <summary>Google Meet and browser meetings</summary>
+                  <p>Pair the optional browser companion for Google Meet, Zoom web, Teams web, and supported meeting sites. It sends the provider name and a page-open hint, without page text or the meeting URL.</p>
+                  <button
+                    className="button secondary small-button"
+                    disabled={!api.openBrowserCompanion}
+                    onClick={() => void api.openBrowserCompanion?.().catch((e) => setBackgroundError(errorText(e)))}
+                  ><FolderOpen size={14} />Open companion folder</button>{" "}
+                  <button
+                    className="button secondary small-button"
+                    disabled={browserBusy || !api.getBrowserConnection}
+                    onClick={async () => {
+                      setBrowserBusy(true);
+                      setBackgroundError("");
+                      try { setBrowserConnection(await api.getBrowserConnection!()); }
+                      catch (e) { setBackgroundError(errorText(e)); }
+                      finally { setBrowserBusy(false); }
+                    }}
+                  >
+                    {browserBusy ? <Loader2 size={14} className="spin" /> : <Plus size={14} />}
+                    Connect browser companion
+                  </button>
+                  {browserConnection && (
+                    browserConnection.available && browserConnection.port && browserConnection.token ? (
+                      <div className="browser-pairing">
+                        <label>
+                          Browser connection code
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            readOnly
+                            value={JSON.stringify({ port: browserConnection.port, token: browserConnection.token })}
+                          />
+                        </label>
+                        <button className="button secondary small-button" onClick={() => {
+                          const code = JSON.stringify({ port: browserConnection.port, token: browserConnection.token });
+                          void (api.copyText ? api.copyText(code) : navigator.clipboard.writeText(code))
+                            .then(() => notify("Browser connection code copied."))
+                            .catch((e) => setBackgroundError(errorText(e)));
+                        }}><Copy size={14} />Copy connection code</button>
+                        <p className="helper-line">Load the bundled browser-extension folder, open its options, and paste this code. Keep the code private. The browser companion must be installed separately.</p>
+                      </div>
+                    ) : <p className="connection-error">{browserConnection.detail || "The browser connection is unavailable."}</p>
+                  )}
+                </details>
+                <p className="background-status">
+                  {background.trayAvailable ? "System tray ready" : "System tray unavailable in this preview or desktop environment"}
+                  {listening ? " · Listening" : " · Listening paused"}
+                </p>
+                {background.detail && <p className="helper-line">{background.detail}</p>}
+                {backgroundError && <p className="connection-error" role="alert">{backgroundError}</p>}
+              </section>
               <section className="panel settings-panel full assistant-settings">
                 <div className="panel-title">
                   <EyeOff size={21} />
@@ -2261,6 +2583,17 @@ export default function App() {
                     CommandOrControl uses Command on Mac and Ctrl on
                     Windows/Linux.
                   </p>
+                  <label className="shortcut-field">
+                    <span>Start meeting shortcut</span>
+                    <input
+                      value={shortcutDraft.meetingShortcut}
+                      maxLength={80}
+                      onChange={(event) => setShortcutDraft((draft) => ({ ...draft, meetingShortcut: event.target.value }))}
+                      placeholder="CommandOrControl+Shift+M"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </label>
                   <div className="assistant-settings-actions">
                     <button
                       className="button secondary"
@@ -2278,7 +2611,7 @@ export default function App() {
                       className="button secondary"
                       disabled={
                         !api.setCompanionVisible ||
-                        companion.visibilityShortcutAvailable === false
+                        (companion.visibilityShortcutAvailable === false && !background.trayAvailable)
                       }
                       onClick={() => void hideAssistant()}
                     >
@@ -2338,7 +2671,7 @@ export default function App() {
                   className="icon-button"
                   aria-label="Hide assistant"
                   title={"Hide assistant · " + visibilityShortcut}
-                  disabled={companion.visibilityShortcutAvailable === false}
+                  disabled={companion.visibilityShortcutAvailable === false && !background.trayAvailable}
                   onClick={() => void hideAssistant()}
                 >
                   <EyeOff size={17} />
@@ -2432,14 +2765,16 @@ export default function App() {
                 <button
                   className={
                     "toggle small-toggle " +
-                    (state.settings.autoAnswer ? "on" : "")
+                    (autoAnswersEnabled(selected.id) ? "on" : "")
                   }
                   role="switch"
-                  aria-checked={state.settings.autoAnswer}
+                  aria-checked={autoAnswersEnabled(selected.id)}
                   aria-label="Auto suggestions"
-                  onClick={() =>
-                    updateSettings({ autoAnswer: !state.settings.autoAnswer })
-                  }
+                  onClick={() => {
+                    const enabled = !autoAnswersEnabled(selected.id);
+                    updateSettings({ autoAnswer: enabled });
+                    updateSession(selected.id, (s) => ({ ...s, assistanceMode: enabled ? "answers" : "manual" }));
+                  }}
                 >
                   <span />
                 </button>
@@ -2482,6 +2817,11 @@ export default function App() {
               className={"live-layout " + (detailsTab ? "details-open" : "")}
             >
               <section className="panel answer-panel live-answer-main">
+                {selected.assistanceMode === "notes" && (
+                  <p className="context-insight" role="status">
+                    Note taking is on. Notes update about once a minute as new transcript arrives; automatic answers are off.
+                  </p>
+                )}
                 {selected.mode === "Meeting" &&
                   dismissedMeetingHint !== selected.id && (
                     <div className="meeting-hint">

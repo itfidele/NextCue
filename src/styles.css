@@ -1080,6 +1080,67 @@ progress {
 }
 
 /* Companion visibility and shortcuts stay together in one compact settings panel. */
+.meeting-action-field,
+.browser-pairing label {
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 14px 0;
+}
+.meeting-action-field select,
+.browser-pairing input {
+  width: 100%;
+}
+.browser-connection {
+  margin-top: 18px;
+  padding: 14px 16px;
+  background: #f7f8fc;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.browser-connection summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.browser-connection > p,
+.background-status {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  margin-top: 12px;
+}
+.meeting-trigger-prompt {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 20px 30px 0;
+  padding: 18px;
+  background: #f3f2ff;
+  border: 1px solid #dedcf7;
+  border-radius: 14px;
+  color: #55509a;
+}
+.meeting-trigger-prompt > div:first-of-type {
+  flex: 1;
+  min-width: 200px;
+}
+.meeting-trigger-prompt strong {
+  font-size: 14px;
+}
+.meeting-trigger-prompt p {
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 5px 0 0;
+}
+.meeting-trigger-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .assistant-settings .panel-title {
   margin-bottom: 20px;
 }

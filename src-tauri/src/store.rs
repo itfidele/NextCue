@@ -72,6 +72,9 @@ pub fn validate_session(value: &Value) -> Result<(), String> {
     }
     enumeration(value, "mode", &["Interview", "Practice", "Meeting"])?;
     enumeration(value, "status", &["ready", "active", "ended"])?;
+    if value.get("assistanceMode").is_some() {
+        enumeration(value, "assistanceMode", &["manual", "notes", "answers"])?;
+    }
     number(value, "createdAt")?;
     number(value, "duration")?;
     string(value, "context", MAX_CONTEXT_BYTES, false)?;
@@ -111,7 +114,13 @@ pub fn validate_state(value: &Value) -> Result<(), String> {
     if !settings.get("autoAnswer").is_some_and(Value::is_boolean) {
         return Err("autoAnswer must be a boolean.".into());
     }
-    for key in ["captureProtection", "jevEnabled"] {
+    for key in [
+        "captureProtection",
+        "jevEnabled",
+        "runInBackground",
+        "startHidden",
+        "meetingDetection",
+    ] {
         if settings.get(key).is_some_and(|value| !value.is_boolean()) {
             return Err(format!("{key} must be a boolean."));
         }
@@ -122,7 +131,14 @@ pub fn validate_state(value: &Value) -> Result<(), String> {
     if settings.get("chatgptModel").is_some() {
         string(settings, "chatgptModel", 256, false)?;
     }
-    for key in ["answerShortcut", "visibilityShortcut"] {
+    if settings.get("meetingAction").is_some() {
+        enumeration(
+            settings,
+            "meetingAction",
+            &["none", "prompt", "listen-notes", "listen-answer"],
+        )?;
+    }
+    for key in ["answerShortcut", "visibilityShortcut", "meetingShortcut"] {
         if settings.get(key).is_some() {
             string(settings, key, 128, true)?;
         }
@@ -375,6 +391,27 @@ mod tests {
         assert!(validate_state(&state).is_err());
         state["settings"]["jevEnabled"] = json!(false);
         state["settings"]["chatgptModel"] = json!("x".repeat(257));
+        assert!(validate_state(&state).is_err());
+    }
+    #[test]
+    fn background_preferences_and_assistance_mode_reject_unsafe_values() {
+        let mut state = default_state();
+        for key in ["runInBackground", "startHidden", "meetingDetection"] {
+            state["settings"][key] = json!(true);
+        }
+        state["settings"]["meetingAction"] = json!("listen-notes");
+        state["settings"]["meetingShortcut"] = json!("CommandOrControl+Shift+M");
+        let mut saved_session = session();
+        saved_session["assistanceMode"] = json!("notes");
+        state["sessions"] = json!([saved_session]);
+        assert!(validate_state(&state).is_ok());
+        state["settings"]["meetingAction"] = json!("listen-anything");
+        assert!(validate_state(&state).is_err());
+        state["settings"]["meetingAction"] = json!("none");
+        state["settings"]["runInBackground"] = json!("true");
+        assert!(validate_state(&state).is_err());
+        state["settings"]["runInBackground"] = json!(false);
+        state["sessions"][0]["assistanceMode"] = json!("other");
         assert!(validate_state(&state).is_err());
     }
     #[tokio::test]

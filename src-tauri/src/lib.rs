@@ -1,12 +1,20 @@
+mod background;
+mod browser;
 mod chatgpt;
 mod claude;
 mod companion;
 mod context;
 mod jev;
+mod meeting;
 mod ollama;
 mod store;
 mod voice;
 
+use background::{
+    ActionSource, BackgroundAction, BackgroundActivity, BackgroundConfiguration, BackgroundService,
+    BackgroundStatus,
+};
+use browser::{BrowserConnection, BrowserService};
 use chatgpt::{ChatgptService, ChatgptStatus};
 use claude::{ClaudeService, ClaudeStatus};
 use companion::{CompanionMode, CompanionService, CompanionStatus};
@@ -35,6 +43,8 @@ struct Services {
     store: StateStore,
     voice: Arc<VoiceService>,
     companion: CompanionService,
+    background: BackgroundService,
+    browser: BrowserService,
     allow_exit: AtomicBool,
 }
 
@@ -73,6 +83,7 @@ async fn configure_companion(
     capture_protection: bool,
     answer_shortcut: String,
     visibility_shortcut: String,
+    meeting_shortcut: Option<String>,
 ) -> Result<CompanionStatus, String> {
     trusted_window(&window)?;
     services.companion.configure(
@@ -81,7 +92,67 @@ async fn configure_companion(
         capture_protection,
         answer_shortcut,
         visibility_shortcut,
+        meeting_shortcut.unwrap_or_else(|| companion::DEFAULT_MEETING_SHORTCUT.into()),
     )
+}
+
+#[tauri::command]
+async fn configure_background(
+    window: WebviewWindow,
+    app: AppHandle,
+    services: State<'_, Services>,
+    config: BackgroundConfiguration,
+) -> Result<BackgroundStatus, String> {
+    trusted_window(&window)?;
+    let enable_browser_connection = config.meeting_detection;
+    let status = services.background.configure(config)?;
+    if enable_browser_connection {
+        services.browser.initialize(app);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+async fn get_background_status(
+    window: WebviewWindow,
+    services: State<'_, Services>,
+) -> Result<BackgroundStatus, String> {
+    trusted_window(&window)?;
+    Ok(services.background.status())
+}
+
+#[tauri::command]
+async fn background_ready(
+    window: WebviewWindow,
+    app: AppHandle,
+    services: State<'_, Services>,
+) -> Result<(), String> {
+    trusted_window(&window)?;
+    services.background.ready(&app);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_browser_connection(
+    window: WebviewWindow,
+    app: AppHandle,
+    services: State<'_, Services>,
+) -> Result<BrowserConnection, String> {
+    trusted_window(&window)?;
+    services.browser.initialize(app);
+    Ok(services.browser.get_connection().await)
+}
+
+#[tauri::command]
+async fn update_background_activity(
+    window: WebviewWindow,
+    app: AppHandle,
+    services: State<'_, Services>,
+    listening: bool,
+    mode: BackgroundActivity,
+) -> Result<(), String> {
+    trusted_window(&window)?;
+    services.background.update_activity(&app, listening, mode)
 }
 
 #[tauri::command]
@@ -185,6 +256,58 @@ async fn open_provider_page(window: WebviewWindow, page: ProviderPage) -> Result
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         Err("External assistants are available from the desktop app.".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn open_browser_companion(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    trusted_window(&window)?;
+    // The destination is fixed by the package. A caller cannot supply a path,
+    // executable, URL, or launch arguments through this command.
+    let folder = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?
+        .join("browser-companion");
+    if !folder.is_dir() || !folder.join("manifest.json").is_file() {
+        return Err("The browser companion files are missing. Install the latest complete NextCue desktop package.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("/usr/bin/open");
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let system_root = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or("Cannot find Windows File Explorer.")?;
+            let mut command = std::process::Command::new(system_root.join("explorer.exe"));
+            command.creation_flags(0x08000000);
+            command
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = std::process::Command::new("/usr/bin/xdg-open");
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        {
+            use std::process::Stdio;
+            let status = command
+                .arg(folder)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|error| format!("Cannot open the browser companion folder: {error}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err("Cannot open the browser companion folder in your file manager.".into())
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        Err("The browser companion is available in the desktop package.".into())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -567,14 +690,24 @@ pub fn run() {
             let claude = ClaudeService::new(directory.join("claude-workspace"));
             let jev = JevService::new(&keyring_service).map_err(std::io::Error::other)?;
             let companion = CompanionService::new(directory.clone());
+            let browser = BrowserService::new(directory.clone());
+            let store = StateStore::new(directory);
+            // Read before showing the window: launching quietly must not flash
+            // the workspace while the webview restores its saved state.
+            let saved_state = tauri::async_runtime::block_on(store.load())
+                .unwrap_or_else(|_| store::default_state());
+            let background =
+                BackgroundService::new(BackgroundConfiguration::from_state(&saved_state));
             app.manage(Services {
                 ollama,
                 chatgpt,
                 claude,
                 jev,
-                store: StateStore::new(directory),
+                store,
                 voice,
                 companion,
+                background,
+                browser,
                 allow_exit: AtomicBool::new(false),
             });
             #[cfg(desktop)]
@@ -615,6 +748,13 @@ pub fn run() {
                                         let _ = services.companion.set_visible(&window, !visible);
                                     }
                                 }
+                                Some(ShortcutAction::Meeting) => {
+                                    services.background.emit_action(
+                                        &app,
+                                        BackgroundAction::MeetingTrigger,
+                                        ActionSource::Shortcut,
+                                    );
+                                }
                                 None => {}
                             }
                         });
@@ -624,6 +764,38 @@ pub fn run() {
                     app.state::<Services>()
                         .companion
                         .initialize_shortcuts(app.handle());
+                    if let Some(window) = app.get_webview_window("main") {
+                        let settings = &saved_state["settings"];
+                        let _ = app.state::<Services>().companion.configure(
+                            app.handle(),
+                            &window,
+                            settings["captureProtection"].as_bool().unwrap_or(true),
+                            settings["answerShortcut"]
+                                .as_str()
+                                .unwrap_or(companion::DEFAULT_ANSWER_SHORTCUT)
+                                .into(),
+                            settings["visibilityShortcut"]
+                                .as_str()
+                                .unwrap_or(companion::DEFAULT_VISIBILITY_SHORTCUT)
+                                .into(),
+                            settings["meetingShortcut"]
+                                .as_str()
+                                .unwrap_or(companion::DEFAULT_MEETING_SHORTCUT)
+                                .into(),
+                        );
+                    }
+                }
+            }
+            let services = app.state::<Services>();
+            services.background.initialize(app.handle());
+            if services.background.current().meeting_detection {
+                services.browser.initialize(app.handle().clone());
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                if !services.background.current().start_hidden
+                    || !services.companion.recovery_available()
+                {
+                    let _ = window.show();
                 }
             }
             Ok(())
@@ -654,10 +826,16 @@ pub fn run() {
             export_session,
             set_companion_mode,
             configure_companion,
+            configure_background,
+            get_background_status,
+            background_ready,
+            get_browser_connection,
+            update_background_activity,
             get_companion_status,
             set_companion_visible,
             copy_text,
-            open_provider_page
+            open_provider_page,
+            open_browser_companion
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Moved(position) = event {
@@ -669,7 +847,19 @@ pub fn run() {
                 if let Some(services) = window.try_state::<Services>() {
                     if !services.allow_exit.load(Ordering::SeqCst) {
                         api.prevent_close();
-                        let _ = window.emit("before-quit", ());
+                        if window.label() == "main" && services.background.close_to_tray() {
+                            let app = window.app_handle().clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Some(window) = app.get_webview_window("main") {
+                                    let _ = app
+                                        .state::<Services>()
+                                        .companion
+                                        .set_visible(&window, false);
+                                }
+                            });
+                        } else {
+                            services.background.request_quit(window.app_handle());
+                        }
                     }
                 }
             }
@@ -677,11 +867,19 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Cannot start NextCue")
         .run(|app, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                background::dispatch_action(
+                    app.clone(),
+                    BackgroundAction::Show,
+                    ActionSource::Dock,
+                );
+            }
             tauri::RunEvent::ExitRequested { api, .. } => {
                 let services = app.state::<Services>();
                 if !services.allow_exit.load(Ordering::SeqCst) {
                     api.prevent_exit();
-                    let _ = app.emit("before-quit", ());
+                    services.background.request_quit(app);
                 }
             }
             tauri::RunEvent::Exit => {
@@ -694,6 +892,8 @@ pub fn run() {
                 services.ollama.shutdown();
                 services.chatgpt.shutdown();
                 services.claude.shutdown();
+                services.background.shutdown();
+                services.browser.shutdown();
                 services.voice.shutdown();
             }
             _ => {}

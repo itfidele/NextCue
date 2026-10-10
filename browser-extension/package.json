@@ -1,0 +1,9 @@
+{
+  "name": "nextcue-meeting-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test routes.test.js"
+  }
+}

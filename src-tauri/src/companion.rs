@@ -1,7 +1,14 @@
 //! The companion is the existing workspace window, so live audio and streamed
 //! answers remain mounted while the user moves between the workspace and pin.
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+};
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, PhysicalSize,
     WebviewWindow,
@@ -14,6 +21,7 @@ const ANSWER_SIZE: LogicalSize<f64> = LogicalSize::new(390.0, 480.0);
 const MAIN_MIN_SIZE: LogicalSize<f64> = LogicalSize::new(860.0, 620.0);
 pub const DEFAULT_ANSWER_SHORTCUT: &str = "CommandOrControl+Shift+Space";
 pub const DEFAULT_VISIBILITY_SHORTCUT: &str = "CommandOrControl+Shift+H";
+pub const DEFAULT_MEETING_SHORTCUT: &str = "CommandOrControl+Shift+M";
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -40,10 +48,12 @@ pub struct CompanionStatus {
     capture_protection: CaptureProtection,
     shortcut_available: bool,
     visibility_shortcut_available: bool,
+    meeting_shortcut_available: bool,
     emergency_shortcut_available: bool,
     visible: bool,
     answer_shortcut: String,
     visibility_shortcut: String,
+    meeting_shortcut: String,
     capture_protection_enabled: bool,
 }
 
@@ -52,8 +62,10 @@ struct Preferences {
     capture_protection_enabled: bool,
     answer_shortcut: String,
     visibility_shortcut: String,
+    meeting_shortcut: String,
     shortcut_available: bool,
     visibility_shortcut_available: bool,
+    meeting_shortcut_available: bool,
     emergency_shortcut_available: bool,
     #[cfg(desktop)]
     registered: Vec<Shortcut>,
@@ -65,8 +77,10 @@ impl Default for Preferences {
             capture_protection_enabled: true,
             answer_shortcut: DEFAULT_ANSWER_SHORTCUT.into(),
             visibility_shortcut: DEFAULT_VISIBILITY_SHORTCUT.into(),
+            meeting_shortcut: DEFAULT_MEETING_SHORTCUT.into(),
             shortcut_available: false,
             visibility_shortcut_available: false,
+            meeting_shortcut_available: false,
             emergency_shortcut_available: false,
             #[cfg(desktop)]
             registered: Vec::new(),
@@ -78,6 +92,7 @@ impl Default for Preferences {
 pub enum ShortcutAction {
     Answer,
     Visibility,
+    Meeting,
 }
 
 #[cfg(desktop)]
@@ -143,6 +158,30 @@ fn shortcut_pair(
         return Err("Use different shortcuts for answers and visibility. Ctrl/Command+Shift+H is reserved for hide/show.".into());
     }
     Ok((answer_name, answer, visibility_name, visibility))
+}
+
+#[cfg(desktop)]
+fn shortcut_set(
+    answer: &str,
+    visibility: &str,
+    meeting: &str,
+) -> Result<(String, Shortcut, String, Shortcut, String, Shortcut), String> {
+    let (answer_name, answer, visibility_name, visibility) = shortcut_pair(answer, visibility)?;
+    let (meeting_name, meeting) = parse_shortcut(meeting, DEFAULT_MEETING_SHORTCUT)?;
+    let emergency: Shortcut = DEFAULT_VISIBILITY_SHORTCUT
+        .parse()
+        .expect("valid built-in shortcut");
+    if meeting == answer || meeting == visibility || meeting == emergency {
+        return Err("Use different shortcuts for answers, hide/show, and the meeting trigger. Ctrl/Command+Shift+H is reserved for hide/show.".into());
+    }
+    Ok((
+        answer_name,
+        answer,
+        visibility_name,
+        visibility,
+        meeting_name,
+        meeting,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -313,6 +352,7 @@ pub struct CompanionService {
     state: Mutex<CompanionState>,
     position_file: PathBuf,
     preferences: Mutex<Preferences>,
+    tray_recovery_available: AtomicBool,
 }
 
 impl CompanionService {
@@ -330,6 +370,7 @@ impl CompanionService {
             }),
             position_file,
             preferences: Mutex::new(Preferences::default()),
+            tray_recovery_available: AtomicBool::new(false),
         }
     }
 
@@ -345,6 +386,24 @@ impl CompanionService {
                 preferences.visibility_shortcut_available = true;
             }
         }
+        // A busy meeting shortcut must not disable the established answer and
+        // recovery controls at startup. User rebinding remains transactional.
+        for (name, meeting) in [
+            (DEFAULT_ANSWER_SHORTCUT, false),
+            (DEFAULT_MEETING_SHORTCUT, true),
+        ] {
+            let shortcut: Shortcut = name.parse().expect("valid built-in shortcut");
+            if app.global_shortcut().register(shortcut).is_ok() {
+                if let Ok(mut preferences) = self.preferences.lock() {
+                    preferences.registered.push(shortcut);
+                    if meeting {
+                        preferences.meeting_shortcut_available = true;
+                    } else {
+                        preferences.shortcut_available = true;
+                    }
+                }
+            }
+        }
         if let Some(window) = app.get_webview_window("main") {
             let _ = self.configure(
                 app,
@@ -352,6 +411,7 @@ impl CompanionService {
                 true,
                 DEFAULT_ANSWER_SHORTCUT.into(),
                 DEFAULT_VISIBILITY_SHORTCUT.into(),
+                DEFAULT_MEETING_SHORTCUT.into(),
             );
         }
     }
@@ -374,6 +434,14 @@ impl CompanionService {
         {
             Some(ShortcutAction::Answer)
         } else if preferences
+            .meeting_shortcut
+            .parse::<Shortcut>()
+            .ok()
+            .as_ref()
+            == Some(shortcut)
+        {
+            Some(ShortcutAction::Meeting)
+        } else if preferences
             .visibility_shortcut
             .parse::<Shortcut>()
             .ok()
@@ -393,15 +461,16 @@ impl CompanionService {
         capture_protection_enabled: bool,
         answer_shortcut: String,
         visibility_shortcut: String,
+        meeting_shortcut: String,
     ) -> Result<CompanionStatus, String> {
         #[cfg(desktop)]
         {
-            let (answer_name, answer, visibility_name, visibility) =
-                shortcut_pair(&answer_shortcut, &visibility_shortcut)?;
+            let (answer_name, answer, visibility_name, visibility, meeting_name, meeting) =
+                shortcut_set(&answer_shortcut, &visibility_shortcut, &meeting_shortcut)?;
             let emergency: Shortcut = DEFAULT_VISIBILITY_SHORTCUT
                 .parse()
                 .expect("valid built-in shortcut");
-            let mut desired = vec![emergency, answer];
+            let mut desired = vec![emergency, answer, meeting];
             if visibility != emergency {
                 desired.push(visibility);
             }
@@ -442,14 +511,16 @@ impl CompanionService {
             preferences.registered = desired;
             preferences.answer_shortcut = answer_name;
             preferences.visibility_shortcut = visibility_name;
+            preferences.meeting_shortcut = meeting_name;
             preferences.shortcut_available = true;
             preferences.visibility_shortcut_available = true;
+            preferences.meeting_shortcut_available = true;
             preferences.emergency_shortcut_available = true;
             preferences.capture_protection_enabled = capture_protection_enabled;
         }
         #[cfg(not(desktop))]
         {
-            let _ = (app, answer_shortcut, visibility_shortcut);
+            let _ = (app, answer_shortcut, visibility_shortcut, meeting_shortcut);
             let mut preferences = self
                 .preferences
                 .lock()
@@ -479,12 +550,27 @@ impl CompanionService {
             ),
             shortcut_available: preferences.shortcut_available,
             visibility_shortcut_available: preferences.visibility_shortcut_available,
+            meeting_shortcut_available: preferences.meeting_shortcut_available,
             emergency_shortcut_available: preferences.emergency_shortcut_available,
             visible: window.is_visible().map_err(|error| error.to_string())?,
             answer_shortcut: preferences.answer_shortcut,
             visibility_shortcut: preferences.visibility_shortcut,
+            meeting_shortcut: preferences.meeting_shortcut,
             capture_protection_enabled: preferences.capture_protection_enabled,
         })
+    }
+
+    pub fn set_tray_recovery(&self, available: bool) {
+        self.tray_recovery_available
+            .store(available, Ordering::SeqCst);
+    }
+
+    pub fn recovery_available(&self) -> bool {
+        self.tray_recovery_available.load(Ordering::SeqCst)
+            || self.preferences.lock().is_ok_and(|preferences| {
+                preferences.visibility_shortcut_available
+                    || preferences.emergency_shortcut_available
+            })
     }
 
     pub fn set_visible(
@@ -507,11 +593,12 @@ impl CompanionService {
                 .preferences
                 .lock()
                 .map_err(|_| "Cannot access the assistant shortcuts.")?;
-            if !preferences.visibility_shortcut_available
+            if !self.tray_recovery_available.load(Ordering::SeqCst)
+                && !preferences.visibility_shortcut_available
                 && !preferences.emergency_shortcut_available
             {
                 return Err(
-                    "Set up an available hide/show shortcut before hiding the assistant.".into(),
+                    "Set up an available hide/show shortcut or system tray before hiding the assistant.".into(),
                 );
             }
             drop(preferences);
@@ -793,10 +880,12 @@ mod tests {
             capture_protection: CaptureProtection::BestEffort,
             shortcut_available: true,
             visibility_shortcut_available: true,
+            meeting_shortcut_available: true,
             emergency_shortcut_available: true,
             visible: true,
             answer_shortcut: DEFAULT_ANSWER_SHORTCUT.into(),
             visibility_shortcut: DEFAULT_VISIBILITY_SHORTCUT.into(),
+            meeting_shortcut: DEFAULT_MEETING_SHORTCUT.into(),
             capture_protection_enabled: true,
         })
         .unwrap();
@@ -834,5 +923,20 @@ mod tests {
         assert_eq!(answer, DEFAULT_ANSWER_SHORTCUT);
         assert_eq!(visibility, DEFAULT_VISIBILITY_SHORTCUT);
         assert!(shortcut_pair("CommandOrControl+Shift+A", "CommandOrControl+Shift+J").is_ok());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn meeting_shortcut_cannot_replace_answer_or_recovery_shortcuts() {
+        for meeting in [
+            DEFAULT_ANSWER_SHORTCUT,
+            DEFAULT_VISIBILITY_SHORTCUT,
+            "Alt+Shift+K",
+        ] {
+            assert!(shortcut_set(DEFAULT_ANSWER_SHORTCUT, "Alt+Shift+K", meeting).is_err());
+        }
+        let (_, _, _, _, name, _) = shortcut_set("", "", "").unwrap();
+        assert_eq!(name, DEFAULT_MEETING_SHORTCUT);
+        assert!(shortcut_set("Alt+Shift+J", "Alt+Shift+K", "Alt+Shift+M").is_ok());
     }
 }

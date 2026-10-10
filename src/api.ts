@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { AppState, DesktopAPI } from "./types";
+import type { AppState, BackgroundAction, DesktopAPI } from "./types";
 
 export const defaults: AppState = {
   sessions: [],
@@ -18,26 +18,35 @@ export const defaults: AppState = {
     answerProvider: "local",
     chatgptModel: "",
     jevEnabled: false,
+    runInBackground: true,
+    startHidden: false,
+    meetingDetection: false,
+    meetingAction: "none",
+    meetingShortcut: "CommandOrControl+Shift+M",
   },
 };
 function subscribe<T>(
   event: string,
   callback: (payload: T) => void,
+  onReady?: (promise: Promise<void>) => void,
 ): () => void {
   let disposed = false;
   let unsubscribe: (() => void) | undefined;
-  listen<T>(event, (e) => {
+  const ready = listen<T>(event, (e) => {
     if (!disposed) callback(e.payload);
   }).then((fn) => {
     if (disposed) fn();
     else unsubscribe = fn;
   });
+  onReady?.(ready);
   return () => {
     disposed = true;
     unsubscribe?.();
   };
 }
 export const native = isTauri();
+let backgroundSubscribed: Promise<void> = Promise.resolve();
+let meetingHintSubscribed: Promise<void> = Promise.resolve();
 const desktop: DesktopAPI = {
   getState: () => invoke("get_state"),
   saveState: (state) => invoke("save_state", { state }),
@@ -83,6 +92,30 @@ const desktop: DesktopAPI = {
     subscribe<{ visible: boolean }>("companion-visibility", (event) =>
       callback(event.visible),
     ),
+  configureBackground: (config) => invoke("configure_background", { config }),
+  getBackgroundStatus: () => invoke("get_background_status"),
+  onBackgroundAction: (callback) => {
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    backgroundSubscribed = listen<BackgroundAction>("background-action", (event) => {
+      if (!disposed) callback(event.payload);
+    }).then((stop) => {
+      if (disposed) stop();
+      else unsubscribe = stop;
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  },
+  onMeetingHint: (callback) => subscribe("meeting-hint", callback, (ready) => { meetingHintSubscribed = ready; }),
+  backgroundReady: async () => {
+    await Promise.all([backgroundSubscribed, meetingHintSubscribed]);
+    await invoke("background_ready");
+  },
+  getBrowserConnection: () => invoke("get_browser_connection"),
+  openBrowserCompanion: () => invoke("open_browser_companion"),
+  updateBackgroundActivity: (activity) => invoke("update_background_activity", { ...activity }),
   minimize: () => {
     void getCurrentWindow().minimize();
   },
@@ -157,6 +190,14 @@ const preview: DesktopAPI = {
   getCompanionStatus: desktopOnly,
   setCompanionVisible: desktopOnly,
   onCompanionVisibility: () => () => {},
+  configureBackground: desktopOnly,
+  getBackgroundStatus: desktopOnly,
+  onBackgroundAction: () => () => {},
+  onMeetingHint: () => () => {},
+  backgroundReady: async () => {},
+  getBrowserConnection: desktopOnly,
+  openBrowserCompanion: desktopOnly,
+  updateBackgroundActivity: async () => {},
   minimize: () => {},
   onBeforeQuit: () => () => {},
   quitApp: desktopOnly,

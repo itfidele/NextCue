@@ -10,6 +10,7 @@ async function bridge(page: Page) {
       captureProtection: true,
       answerShortcut: "CommandOrControl+Shift+Space",
       visibilityShortcut: "CommandOrControl+Shift+H",
+      meetingShortcut: "CommandOrControl+Shift+M",
     };
     const companionState = () => ({
       mode: companionMode,
@@ -20,8 +21,21 @@ async function bridge(page: Page) {
       captureProtectionEnabled: companionConfig.captureProtection,
       shortcutAvailable: true,
       visibilityShortcutAvailable: true,
+      meetingShortcutAvailable: true,
       answerShortcut: companionConfig.answerShortcut,
       visibilityShortcut: companionConfig.visibilityShortcut,
+      meetingShortcut: companionConfig.meetingShortcut,
+    });
+    let backgroundConfig = {
+      runInBackground: true,
+      startHidden: false,
+      meetingDetection: false,
+      meetingAction: "none",
+    };
+    const backgroundState = () => ({
+      ...backgroundConfig,
+      trayAvailable: true,
+      detectionAvailable: true,
     });
     const emit = (name: string, event: any) => {
       if (name === "companion-visibility")
@@ -34,11 +48,23 @@ async function bridge(page: Page) {
     (window as any).__testCompanionModes = [];
     (window as any).__testCancelledRequests = [];
     (window as any).__testStopListeningCalls = 0;
+    (window as any).__testStartListeningCalls = [];
+    (window as any).__testStartListeningDelay = 0;
+    (window as any).__testBackgroundConfigurations = [];
+    (window as any).__testBackgroundActivity = [];
+    (window as any).__testBackgroundReadyCalls = [];
+    (window as any).__testRuntimeDelay = Number(localStorage.getItem("test-runtime-delay") || 0);
+    (window as any).__testProviderDelay = Number(localStorage.getItem("test-provider-delay") || 0);
+    (window as any).__testReadyAction = localStorage.getItem("test-ready-action") || "";
+    (window as any).__testRuntimeResolved = false;
+    (window as any).__testChatgptResolved = false;
+    (window as any).__testClaudeResolved = false;
+    (window as any).__testBackgroundConfigureError = false;
     (window as any).__testCompanionConfigurations = [];
     (window as any).__testCompanionVisibilityCalls = [];
     (window as any).__testCompanionStatusReads = 0;
     (window as any).__testConfigureError = false;
-    (window as any).__testChatgpt = {
+    (window as any).__testChatgpt = JSON.parse(localStorage.getItem("test-chatgpt-status") || "null") || {
       connected: false,
       planUsage: false,
       models: [],
@@ -84,14 +110,22 @@ async function bridge(page: Page) {
         JSON.parse(localStorage.getItem("test-state") || "null") || blank,
       saveState: async (state: any) =>
         localStorage.setItem("test-state", JSON.stringify(state)),
-      status: async () => ({
-        ollama: true,
-        models: [{ name: "qwen2.5:7b-instruct", size: 4683000000 }],
-        transcription: true,
-        platform: "macos",
-      }),
+      status: async () => {
+        if ((window as any).__testRuntimeDelay)
+          await new Promise((resolve) => setTimeout(resolve, (window as any).__testRuntimeDelay));
+        (window as any).__testRuntimeResolved = true;
+        return {
+          ollama: true,
+          models: [{ name: "qwen2.5:7b-instruct", size: 4683000000 }],
+          transcription: true,
+          platform: "macos",
+        };
+      },
       getChatgptStatus: async (refreshModels = false) => {
         (window as any).__testChatgptRefreshRequests.push(refreshModels);
+        if ((window as any).__testProviderDelay)
+          await new Promise((resolve) => setTimeout(resolve, (window as any).__testProviderDelay));
+        (window as any).__testChatgptResolved = true;
         return JSON.parse(JSON.stringify((window as any).__testChatgpt));
       },
       signInChatgpt: async () => {
@@ -120,8 +154,12 @@ async function bridge(page: Page) {
         (window as any).__testChatgpt.activeAccountId = accountId;
         return (window as any).__testChatgpt;
       },
-      getClaudeStatus: async () =>
-        JSON.parse(JSON.stringify((window as any).__testClaude)),
+      getClaudeStatus: async () => {
+        if ((window as any).__testProviderDelay)
+          await new Promise((resolve) => setTimeout(resolve, (window as any).__testProviderDelay));
+        (window as any).__testClaudeResolved = true;
+        return JSON.parse(JSON.stringify((window as any).__testClaude));
+      },
       getJevStatus: async () => ({ configured: !!jevKey }),
       saveJevKey: async (key: string) => {
         jevKey = key;
@@ -176,6 +214,11 @@ async function bridge(page: Page) {
       onToken: (fn: Callback) => on("token", fn),
       inputDevices: async () => [{ id: "system", name: "Mac system audio" }],
       startListening: async (request: any) => {
+        (window as any).__testStartListeningCalls.push(request);
+        if ((window as any).__testStartListeningDelay)
+          await new Promise((resolve) =>
+            setTimeout(resolve, (window as any).__testStartListeningDelay),
+          );
         activeSession = request.sessionId;
         (window as any).__testActiveSession = activeSession;
         emit("status", { sessionId: activeSession, listening: true });
@@ -226,6 +269,35 @@ async function bridge(page: Page) {
         on("companion-visibility", (event: any) =>
           fn(typeof event === "boolean" ? event : event.visible),
         ),
+      configureBackground: async (config: typeof backgroundConfig) => {
+        (window as any).__testBackgroundConfigurations.push(config);
+        if ((window as any).__testBackgroundConfigureError)
+          throw new Error("Background configuration could not be applied.");
+        backgroundConfig = config;
+        return backgroundState();
+      },
+      getBackgroundStatus: async () => backgroundState(),
+      backgroundReady: async () => {
+        (window as any).__testBackgroundReadyCalls.push({
+          runtimeReady: (window as any).__testRuntimeResolved,
+          chatgptReady: (window as any).__testChatgptResolved,
+          claudeReady: (window as any).__testClaudeResolved,
+        });
+        if (backgroundConfig.startHidden)
+          emit("companion-visibility", { visible: false });
+        if ((window as any).__testReadyAction)
+          emit("background-action", { action: (window as any).__testReadyAction, source: "tray" });
+      },
+      updateBackgroundActivity: async (activity: any) => {
+        (window as any).__testBackgroundActivity.push(activity);
+      },
+      onBackgroundAction: (fn: Callback) => on("background-action", fn),
+      onMeetingHint: (fn: Callback) => on("meeting-hint", fn),
+      getBrowserConnection: async () => ({
+        available: true,
+        port: 12345,
+        token: "test-browser-token",
+      }),
       minimize: () => {},
       onBeforeQuit: (fn: Callback) => on("quit", fn),
       quitApp: async (state: any) => {
@@ -283,6 +355,23 @@ async function heard(page: Page, text: string) {
       time: Date.now(),
     });
   }, text);
+}
+async function backgroundAction(
+  page: Page,
+  action: "show" | "settings" | "meeting-trigger" | "listen" | "notes" | "answers" | "pause",
+  source: "tray" | "shortcut" | "meeting-hint" = "tray",
+  app?: string,
+) {
+  await page.evaluate(
+    (event) => (window as any).__testEmit("background-action", event),
+    { action, source, app },
+  );
+}
+async function meetingHint(page: Page, app = "Zoom", kind = "desktop-app") {
+  await page.evaluate(
+    (event) => (window as any).__testEmit("meeting-hint", event),
+    { app, kind, detail: "A meeting application is open. Confirm whether you are in a call." },
+  );
 }
 async function chooseProvider(
   page: Page,
@@ -356,6 +445,429 @@ async function enableContextHelper(page: Page) {
 test.beforeEach(async ({ page }) => {
   await bridge(page);
   await page.goto("/");
+});
+
+test("background defaults and a meeting-app hint do not start recording or replace sessions", async ({
+  page,
+}) => {
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__testBackgroundConfigurations.at(-1)),
+    )
+    .toEqual({
+      runInBackground: true,
+      startHidden: false,
+      meetingDetection: false,
+      meetingAction: "none",
+    });
+  await meetingHint(page);
+  await page.waitForTimeout(200);
+  expect(
+    await page.evaluate(() => (window as any).__testStartListeningCalls),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(() => (window as any).__testRequests),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem("test-state") || "null")?.sessions || [],
+    ),
+  ).toEqual([]);
+
+  await create(page, "Keep my existing meeting", { mode: "Meeting" });
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.length || 0))
+    .toBe(1);
+  const originalId = await page.evaluate(
+    () => JSON.parse(localStorage.getItem("test-state")!).sessions[0].id,
+  );
+  await meetingHint(page);
+  await page.waitForTimeout(200);
+  expect(
+    await page.evaluate(() => (window as any).__testStartListeningCalls),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem("test-state")!).sessions.map((s: any) => s.id),
+    ),
+  ).toEqual([originalId]);
+});
+
+test("tray listening starts one Meeting session, stays hidden, and pause preserves it", async ({
+  page,
+}) => {
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testBackgroundConfigurations.length))
+    .toBeGreaterThan(0);
+  await page.evaluate(() => {
+    (window as any).__testStartListeningDelay = 150;
+    (window as any).__testEmit("companion-visibility", { visible: false });
+    (window as any).__testEmit("background-action", { action: "listen", source: "tray" });
+    (window as any).__testEmit("background-action", { action: "listen", source: "tray" });
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length))
+    .toBe(1);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testActiveSession || ""))
+    .not.toBe("");
+  await expect(page.locator(".assistant-hidden")).toHaveAttribute("aria-hidden", "true");
+  expect(
+    await page.evaluate(() => (window as any).__testCompanionVisibilityCalls),
+  ).toEqual([]);
+  const listeningId = await page.evaluate(() => (window as any).__testActiveSession);
+  await expect
+    .poll(() =>
+      page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!)?.sessions?.length),
+    )
+    .toBe(1);
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem("test-state")!).sessions[0].mode,
+    ),
+  ).toBe("Meeting");
+  await backgroundAction(page, "pause");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStopListeningCalls))
+    .toBe(1);
+  await backgroundAction(page, "show");
+  await expect(page.locator(".assistant-hidden")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Start listening", exact: true })).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem("test-state")!).sessions[0].id,
+    ),
+  ).toBe(listeningId);
+  expect(
+    await page.evaluate(() => (window as any).__testStartListeningCalls.length),
+  ).toBe(1);
+});
+
+test("background preferences persist and asking first waits for an explicit meeting choice", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1160, height: 780 });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Background & meetings", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("switch", { name: "Keep running in system tray", exact: true }))
+    .toHaveAttribute("aria-checked", "true");
+  await expect(page.getByRole("switch", { name: "Detect meeting hints", exact: true }))
+    .toHaveAttribute("aria-checked", "false");
+  await expect(page.getByRole("combobox", { name: "When a meeting is triggered", exact: true })).toHaveValue("none");
+  await page.getByRole("heading", { name: "Background & meetings", exact: true }).scrollIntoViewIfNeeded();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.screenshot({ path: "/private/tmp/nextcue-background-settings.png", animations: "disabled" });
+  await page.getByRole("switch", { name: "Start in system tray", exact: true }).click();
+  await page.getByRole("switch", { name: "Detect meeting hints", exact: true }).click();
+  await page.getByRole("combobox", { name: "When a meeting is triggered", exact: true }).selectOption("prompt");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testBackgroundConfigurations.at(-1)))
+    .toEqual({
+      runInBackground: true,
+      startHidden: true,
+      meetingDetection: true,
+      meetingAction: "prompt",
+    });
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const s = JSON.parse(localStorage.getItem("test-state") || "null")?.settings;
+        if (!s) return null;
+        return {
+          runInBackground: s.runInBackground,
+          startHidden: s.startHidden,
+          meetingDetection: s.meetingDetection,
+          meetingAction: s.meetingAction,
+        };
+      }),
+    )
+    .toEqual({
+      runInBackground: true,
+      startHidden: true,
+      meetingDetection: true,
+      meetingAction: "prompt",
+    });
+  await page.reload();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testBackgroundConfigurations.length))
+    .toBeGreaterThan(0);
+  await expect(page.locator(".assistant-hidden")).toHaveAttribute("aria-hidden", "true");
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toEqual([]);
+  await backgroundAction(page, "settings");
+  await expect(page.getByRole("combobox", { name: "When a meeting is triggered", exact: true })).toHaveValue("prompt");
+  await expect(page.getByRole("switch", { name: "Detect meeting hints", exact: true }))
+    .toHaveAttribute("aria-checked", "true");
+  await meetingHint(page, "Google Meet", "browser-page");
+  await expect(page.locator("body")).toContainText("Google Meet");
+  await page.getByRole("region", { name: "Meeting detected", exact: true }).scrollIntoViewIfNeeded();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.screenshot({ path: "/private/tmp/nextcue-meeting-trigger.png", animations: "disabled" });
+  await page.waitForTimeout(200);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toEqual([]);
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  await page.getByRole("button", { name: "Take notes", exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length))
+    .toBe(1);
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+});
+
+test("tray notes preserve the selected session and suppress answers until explicitly requested", async ({
+  page,
+}) => {
+  await create(page, "Existing project discussion", { mode: "Meeting" });
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.length || 0))
+    .toBe(1);
+  const originalId = await page.evaluate(
+    () => JSON.parse(localStorage.getItem("test-state")!).sessions[0].id,
+  );
+  await page.getByRole("switch", { name: "Auto suggestions", exact: true }).click();
+  await backgroundAction(page, "notes");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length))
+    .toBe(1);
+  await heard(page, "How should we reduce our deployment risk?");
+  await page.waitForTimeout(1200);
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  expect(await page.evaluate(() => (window as any).__testActiveSession)).toBe(originalId);
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!).sessions.length),
+  ).toBe(1);
+  await backgroundAction(page, "answers");
+  await heard(page, "What is a safe rollout strategy?");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testRequests.length))
+    .toBe(1);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).__testActiveSession)).toBe(originalId);
+});
+
+test("browser pairing is shown on request and the code is never saved with settings", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.locator("body")).not.toContainText("test-browser-token");
+  await page.locator("summary").filter({ hasText: "Google Meet and browser meetings" }).click();
+  await page.getByRole("button", { name: "Connect browser companion", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        document.body.innerText +
+        Array.from(document.querySelectorAll("input, textarea"))
+          .map((input) => (input as HTMLInputElement).value)
+          .join(" "),
+      ),
+    )
+    .toContain("test-browser-token");
+  await page.waitForTimeout(600);
+  expect(await page.evaluate(() => localStorage.getItem("test-state"))).not.toContain("test-browser-token");
+});
+
+test("opted-in browser meeting hints start notes while hidden and repeat hints do not restart audio", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("combobox", { name: "When a meeting is triggered", exact: true }).selectOption("listen-notes");
+  await meetingHint(page, "Google Meet", "browser-page");
+  await page.waitForTimeout(200);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toEqual([]);
+  await page.getByRole("switch", { name: "Detect meeting hints", exact: true }).click();
+  await page.evaluate(() =>
+    (window as any).__testEmit("companion-visibility", { visible: false }),
+  );
+  await meetingHint(page, "Google Meet", "browser-page");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length))
+    .toBe(1);
+  await expect(page.locator(".assistant-hidden")).toHaveAttribute("aria-hidden", "true");
+  await meetingHint(page, "Google Meet", "browser-page");
+  await page.waitForTimeout(200);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).__testCompanionVisibilityCalls)).toEqual([]);
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!)?.sessions?.length))
+    .toBe(1);
+  const stopCallsBeforeSettings = await page.evaluate(() => (window as any).__testStopListeningCalls);
+  const activeBeforeSettings = await page.evaluate(() => (window as any).__testActiveSession);
+  await backgroundAction(page, "settings");
+  await expect(page.getByRole("heading", { name: "Background & meetings", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).__testStopListeningCalls)).toBe(stopCallsBeforeSettings);
+  expect(await page.evaluate(() => (window as any).__testActiveSession)).toBe(activeBeforeSettings);
+});
+
+test("note taking summarizes fresh transcript on its timer and leaves unchanged notes alone", async ({
+  page,
+}) => {
+  await page.clock.install();
+  await page.reload();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testBackgroundConfigurations.length))
+    .toBeGreaterThan(0);
+  await backgroundAction(page, "notes");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length))
+    .toBe(1);
+  await heard(page, "We agreed to roll out to ten percent of users tomorrow. Sam will check errors.");
+  await page.clock.fastForward(61_000);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testRequests.length))
+    .toBe(1);
+  expect(
+    await page.evaluate(() => (window as any).__testRequests[0].kind),
+  ).toBe("summary");
+  await page.clock.runFor(500);
+  await page.clock.fastForward(61_000);
+  expect(await page.evaluate(() => (window as any).__testRequests.length)).toBe(1);
+  await heard(page, "The rollout is now scheduled for Monday after the review.");
+  await page.clock.fastForward(61_000);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testRequests.length))
+    .toBe(2);
+  expect(
+    await page.evaluate(() => (window as any).__testRequests.map((request: any) => request.kind)),
+  ).toEqual(["summary", "summary"]);
+});
+
+test("pausing note taking includes the final audio segment in the saved recap", async ({
+  page,
+}) => {
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testBackgroundConfigurations.length))
+    .toBeGreaterThan(0);
+  await backgroundAction(page, "notes");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testActiveSession || ""))
+    .not.toBe("");
+  await heard(page, "We agreed to ship after the accessibility review.");
+  await backgroundAction(page, "pause");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testRequests.length))
+    .toBe(1);
+  const request = await page.evaluate(() => (window as any).__testRequests[0]);
+  expect(request.kind).toBe("summary");
+  expect(request.transcript).toContain("We agreed to ship after the accessibility review.");
+  expect(request.transcript).toContain("The final audio segment.");
+  await expect
+    .poll(() =>
+      page.evaluate(() => JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0]?.summary || ""),
+    )
+    .toContain("A grounded answer based on your background.");
+  await expect(page.getByRole("button", { name: "Start listening", exact: true })).toBeVisible();
+});
+
+test("failed meeting detection configuration leaves the saved opt-in disabled", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => localStorage.getItem("test-state")))
+    .not.toBeNull();
+  await page.evaluate(() => ((window as any).__testBackgroundConfigureError = true));
+  await page.getByRole("switch", { name: "Detect meeting hints", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("Background configuration could not be applied.");
+  await expect(page.getByRole("switch", { name: "Detect meeting hints", exact: true }))
+    .toHaveAttribute("aria-checked", "false");
+  await meetingHint(page);
+  await page.waitForTimeout(600);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toEqual([]);
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!).settings.meetingDetection),
+  ).toBe(false);
+});
+
+test("queued startup notes wait for audio and account checks and use the selected ChatGPT model", async ({
+  page,
+}) => {
+  await page.clock.install();
+  await page.evaluate(async () => {
+    const saved = await (window as any).desktop.getState();
+    saved.settings = { ...saved.settings, answerProvider: "chatgpt", chatgptModel: "gpt-test-fast" };
+    localStorage.setItem("test-state", JSON.stringify(saved));
+    localStorage.setItem("test-runtime-delay", "300");
+    localStorage.setItem("test-provider-delay", "600");
+    localStorage.setItem("test-ready-action", "notes");
+    localStorage.setItem("test-chatgpt-status", JSON.stringify({
+      connected: true,
+      planUsage: true,
+      email: "person@example.com",
+      activeAccountId: "account-a",
+      accounts: [{ id: "account-a", label: "Personal", email: "person@example.com", connected: true }],
+      models: [{ slug: "gpt-test-fast", displayName: "Fast test model" }],
+    }));
+  });
+  await page.reload();
+  await page.clock.runFor(800);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length))
+    .toBe(1);
+  expect(await page.evaluate(() => (window as any).__testBackgroundReadyCalls)).toEqual([
+    { runtimeReady: true, chatgptReady: true, claudeReady: true },
+  ]);
+  await heard(page, "We agreed to release on Monday, and Sam will write the checklist.");
+  await page.clock.fastForward(61_000);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testRequests.length))
+    .toBe(1);
+  expect(await page.evaluate(() => (window as any).__testRequests[0])).toMatchObject({
+    kind: "summary",
+    sessionMode: "Meeting",
+    provider: "chatgpt",
+    model: "gpt-test-fast",
+  });
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+});
+
+test("notes started from a paused interview create a separate Meeting and preserve the interview", async ({
+  page,
+}) => {
+  await create(page, "Keep my interview preparation");
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.length || 0))
+    .toBe(1);
+  const originalId = await page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!).sessions[0].id);
+  await backgroundAction(page, "notes");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length))
+    .toBe(1);
+  const startedId = await page.evaluate(() => (window as any).__testStartListeningCalls[0].sessionId);
+  expect(startedId).not.toBe(originalId);
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.length || 0))
+    .toBe(2);
+  const sessions = await page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!).sessions);
+  expect(sessions.find((session: any) => session.id === originalId)).toMatchObject({
+    title: "Keep my interview preparation",
+    mode: "Interview",
+  });
+  expect(sessions.find((session: any) => session.id === startedId)).toMatchObject({ mode: "Meeting", assistanceMode: "notes" });
+});
+
+test("notes in an already listening interview keep its audio session and request a meeting recap", async ({
+  page,
+}) => {
+  await create(page, "Active interview audio");
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  const originalId = await page.evaluate(() => (window as any).__testActiveSession);
+  await backgroundAction(page, "notes");
+  await heard(page, "We agreed to send the schedule after the call.");
+  await backgroundAction(page, "pause");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__testRequests.length))
+    .toBe(1);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toHaveLength(1);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls[0].sessionId)).toBe(originalId);
+  expect(await page.evaluate(() => (window as any).__testRequests[0])).toMatchObject({
+    kind: "summary",
+    sessionMode: "Meeting",
+    sessionTitle: "Active interview audio",
+  });
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.length || 0))
+    .toBe(1);
 });
 
 test("a session title that exceeds the UTF-8 limit stays editable before saving", async ({
@@ -791,6 +1303,9 @@ test("custom assistant shortcuts and capture preferences apply and survive reloa
   await page
     .getByLabel("Hide / show shortcut", { exact: true })
     .fill("CommandOrControl+Alt+H");
+  await page
+    .getByLabel("Start meeting shortcut", { exact: true })
+    .fill("CommandOrControl+Alt+M");
   expect(
     await page.evaluate(
       () => (window as any).__testCompanionConfigurations.length,
@@ -814,6 +1329,7 @@ test("custom assistant shortcuts and capture preferences apply and survive reloa
     captureProtection: false,
     answerShortcut: "CommandOrControl+Alt+A",
     visibilityShortcut: "CommandOrControl+Alt+H",
+    meetingShortcut: "CommandOrControl+Alt+M",
   };
   await expect
     .poll(() =>
@@ -831,6 +1347,7 @@ test("custom assistant shortcuts and capture preferences apply and survive reloa
           captureProtection: settings.captureProtection,
           answerShortcut: settings.answerShortcut,
           visibilityShortcut: settings.visibilityShortcut,
+          meetingShortcut: settings.meetingShortcut,
         };
       }),
     )
@@ -843,6 +1360,9 @@ test("custom assistant shortcuts and capture preferences apply and survive reloa
   await expect(
     page.getByLabel("Hide / show shortcut", { exact: true }),
   ).toHaveValue(configured.visibilityShortcut);
+  await expect(
+    page.getByLabel("Start meeting shortcut", { exact: true }),
+  ).toHaveValue(configured.meetingShortcut);
   await page.screenshot({
     path: "/private/tmp/nextcue-settings.png",
     fullPage: true,
@@ -1070,6 +1590,7 @@ test("a startup shortcut conflict restores accepted native settings and keeps th
     captureProtection: false,
     answerShortcut: "CommandOrControl+Alt+A",
     visibilityShortcut: "CommandOrControl+Alt+H",
+    meetingShortcut: "CommandOrControl+Alt+M",
   };
   await page.evaluate(async (requested) => {
     const saved = await (window as any).desktop.getState();
@@ -1086,7 +1607,7 @@ test("a startup shortcut conflict restores accepted native settings and keeps th
   );
   await expect
     .poll(() => page.evaluate(() => (window as any).__testCompanionStatusReads))
-    .toBe(1);
+    .toBeGreaterThanOrEqual(2);
   expect(
     await page.evaluate(() =>
       (window as any).__testCompanionConfigurations.at(-1),
@@ -1104,6 +1625,9 @@ test("a startup shortcut conflict restores accepted native settings and keeps th
   await expect(
     page.getByLabel("Hide / show shortcut", { exact: true }),
   ).toHaveValue(requested.visibilityShortcut);
+  await expect(
+    page.getByLabel("Start meeting shortcut", { exact: true }),
+  ).toHaveValue(requested.meetingShortcut);
   await expect(
     page
       .locator(".assistant-settings .shortcut-status")
