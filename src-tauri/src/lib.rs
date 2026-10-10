@@ -84,6 +84,7 @@ async fn configure_companion(
     answer_shortcut: String,
     visibility_shortcut: String,
     meeting_shortcut: Option<String>,
+    click_through: Option<bool>,
 ) -> Result<CompanionStatus, String> {
     trusted_window(&window)?;
     services.companion.configure(
@@ -93,6 +94,7 @@ async fn configure_companion(
         answer_shortcut,
         visibility_shortcut,
         meeting_shortcut.unwrap_or_else(|| companion::DEFAULT_MEETING_SHORTCUT.into()),
+        click_through.unwrap_or(false),
     )
 }
 
@@ -618,6 +620,34 @@ async fn export_session(
 ) -> Result<bool, String> {
     trusted_window(&window)?;
     let markdown = store::session_markdown(&session)?;
+    export_text_file(app, &session, markdown, "md", "Markdown", "Export session").await
+}
+
+#[tauri::command]
+async fn export_subtitles(
+    window: WebviewWindow,
+    app: AppHandle,
+    session: Value,
+    format: String,
+) -> Result<bool, String> {
+    trusted_window(&window)?;
+    let subtitles = store::session_subtitles(&session, &format)?;
+    let label = if format == "srt" {
+        "SubRip subtitles"
+    } else {
+        "WebVTT subtitles"
+    };
+    export_text_file(app, &session, subtitles, &format, label, "Export subtitles").await
+}
+
+async fn export_text_file(
+    app: AppHandle,
+    session: &Value,
+    contents: String,
+    extension: &str,
+    label: &str,
+    dialog_title: &str,
+) -> Result<bool, String> {
     let title = session["title"].as_str().unwrap_or("session");
     let filename: String = title
         .chars()
@@ -631,7 +661,7 @@ async fn export_session(
         })
         .collect();
     let filename = format!(
-        "{}.md",
+        "{}.{extension}",
         if filename.trim_matches('-').is_empty() {
             "nextcue-session"
         } else {
@@ -641,9 +671,9 @@ async fn export_session(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .set_title("Export session")
+        .set_title(dialog_title)
         .set_file_name(filename)
-        .add_filter("Markdown", &["md"])
+        .add_filter(label, &[extension])
         .save_file(move |file| {
             let _ = sender.send(file);
         });
@@ -654,9 +684,9 @@ async fn export_session(
         .into_path()
         .map_err(|_| "Choose a local save location.")?;
     if path.extension().is_none() {
-        path.set_extension("md");
+        path.set_extension(extension);
     }
-    tokio::fs::write(&path, markdown)
+    tokio::fs::write(&path, contents)
         .await
         .map_err(|e| format!("Cannot export this session: {e}"))?;
     Ok(true)
@@ -732,7 +762,7 @@ pub fn run() {
                                 Some(ShortcutAction::Answer) => {
                                     if window.is_visible().ok() == Some(false) {
                                         if let Ok(status) =
-                                            services.companion.set_visible(&window, true)
+                                            services.companion.reveal_for_answer(&window)
                                         {
                                             // Restoring an already open answer card
                                             // must not immediately collapse it again.
@@ -782,6 +812,7 @@ pub fn run() {
                                 .as_str()
                                 .unwrap_or(companion::DEFAULT_MEETING_SHORTCUT)
                                 .into(),
+                            settings["clickThrough"].as_bool().unwrap_or(false),
                         );
                     }
                 }
@@ -792,11 +823,9 @@ pub fn run() {
                 services.browser.initialize(app.handle().clone());
             }
             if let Some(window) = app.get_webview_window("main") {
-                if !services.background.current().start_hidden
-                    || !services.companion.recovery_available()
-                {
-                    let _ = window.show();
-                }
+                let visible = !services.background.current().start_hidden
+                    || !services.companion.recovery_available();
+                let _ = services.companion.set_visible(&window, visible);
             }
             Ok(())
         })
@@ -824,6 +853,7 @@ pub fn run() {
             stop_listening,
             import_context,
             export_session,
+            export_subtitles,
             set_companion_mode,
             configure_companion,
             configure_background,

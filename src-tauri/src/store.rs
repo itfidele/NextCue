@@ -16,7 +16,7 @@ pub const MAX_STATE_BYTES: usize = 12 * 1024 * 1024;
 pub const MAX_CONTEXT_BYTES: usize = 100000;
 
 pub fn default_state() -> Value {
-    json!({ "sessions": [], "settings": { "model": DEFAULT_MODEL, "ollamaUrl": DEFAULT_URL, "language": "en", "autoAnswer": true, "audioSource": "microphone", "inputDevice": "" } })
+    json!({ "sessions": [], "settings": { "model": DEFAULT_MODEL, "ollamaUrl": DEFAULT_URL, "language": "en", "autoAnswer": true, "audioSource": "microphone", "inputDevice": "", "clickThrough": false } })
 }
 
 fn string<'a>(
@@ -70,10 +70,29 @@ pub fn validate_session(value: &Value) -> Result<(), String> {
     for key in ["title", "company", "role"] {
         string(value, key, 256, false)?;
     }
-    enumeration(value, "mode", &["Interview", "Practice", "Meeting"])?;
+    enumeration(
+        value,
+        "mode",
+        &["Interview", "Practice", "Meeting", "Video"],
+    )?;
     enumeration(value, "status", &["ready", "active", "ended"])?;
     if value.get("assistanceMode").is_some() {
-        enumeration(value, "assistanceMode", &["manual", "notes", "answers"])?;
+        enumeration(
+            value,
+            "assistanceMode",
+            &["manual", "notes", "answers", "subtitles"],
+        )?;
+    }
+    for key in ["mediaStartedAt", "mediaOffsetSeconds"] {
+        if value.get(key).is_some() {
+            number(value, key)?;
+        }
+    }
+    if value["mediaOffsetSeconds"]
+        .as_f64()
+        .is_some_and(|offset| offset > 359_999.0)
+    {
+        return Err("Video start position must be less than 100 hours.".into());
     }
     number(value, "createdAt")?;
     number(value, "duration")?;
@@ -84,6 +103,13 @@ pub fn validate_session(value: &Value) -> Result<(), String> {
         string(entry, "text", 16000, false)?;
         number(entry, "time")?;
         enumeration(entry, "source", &["microphone", "system", "typed"])?;
+        if entry.get("startMs").is_some() || entry.get("endMs").is_some() {
+            let start = number(entry, "startMs")?;
+            let end = number(entry, "endMs")?;
+            if end <= start {
+                return Err("Transcript end must be after its start.".into());
+            }
+        }
     }
     for answer in array(value, "answers", 1000)? {
         string(answer, "id", 128, true)?;
@@ -116,6 +142,7 @@ pub fn validate_state(value: &Value) -> Result<(), String> {
     }
     for key in [
         "captureProtection",
+        "clickThrough",
         "jevEnabled",
         "runInBackground",
         "startHidden",
@@ -304,7 +331,12 @@ pub fn session_markdown(session: &Value) -> Result<String, String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
-        output.push_str(&format!("## Session recap\n\n{summary}\n\n"));
+        let heading = match session["mode"].as_str() {
+            Some("Video") => "Video notes",
+            Some("Meeting") => "Meeting notes",
+            _ => "Session recap",
+        };
+        output.push_str(&format!("## {heading}\n\n{summary}\n\n"));
     }
     output.push_str("## Transcript\n\n");
     for entry in session["transcript"].as_array().unwrap() {
@@ -335,6 +367,94 @@ pub fn session_markdown(session: &Value) -> Result<String, String> {
         output.push_str("_No answers generated._\n");
     }
     Ok(output)
+}
+
+/// Export actual recognition intervals only. Older untimed transcript records
+/// remain readable, but cannot establish reliable subtitle cue durations.
+pub fn session_subtitles(session: &Value, format: &str) -> Result<String, String> {
+    validate_session(session)?;
+    if !["srt", "vtt"].contains(&format) {
+        return Err("Choose SRT or WebVTT subtitles.".into());
+    }
+    let mut entries: Vec<&Value> = session["transcript"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["source"].as_str() != Some("typed")
+                && entry.get("startMs").is_some()
+                && entry.get("endMs").is_some()
+                && !entry["text"].as_str().unwrap_or_default().trim().is_empty()
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        a["startMs"]
+            .as_f64()
+            .unwrap()
+            .total_cmp(&b["startMs"].as_f64().unwrap())
+    });
+    let first = entries
+        .first()
+        .ok_or("No timed speech is available. Start listening to capture subtitles first.")?;
+    let origin = session["mediaStartedAt"]
+        .as_f64()
+        .unwrap_or_else(|| first["startMs"].as_f64().unwrap());
+    let offset = session["mediaOffsetSeconds"].as_f64().unwrap_or_default() * 1000.0;
+    let mut output = if format == "vtt" {
+        "WEBVTT\n\n".to_owned()
+    } else {
+        String::new()
+    };
+    let mut count = 0;
+    for entry in entries {
+        let raw_start = entry["startMs"].as_f64().unwrap() - origin + offset;
+        let raw_end = entry["endMs"].as_f64().unwrap() - origin + offset;
+        // A cue wholly before the selected timeline cannot be displayed.
+        if raw_end <= 0.0 {
+            continue;
+        }
+        let start = raw_start.max(0.0).round() as u64;
+        let end = (raw_end.max(0.0).round() as u64).max(start + 1);
+        let text = subtitle_text(entry["text"].as_str().unwrap());
+        if text.is_empty() {
+            continue;
+        }
+        count += 1;
+        output.push_str(&format!(
+            "{count}\n{} --> {}\n{text}\n\n",
+            subtitle_timestamp(start, format),
+            subtitle_timestamp(end, format)
+        ));
+    }
+    if count == 0 {
+        return Err("No timed speech falls within the subtitle timeline.".into());
+    }
+    Ok(output)
+}
+
+fn subtitle_timestamp(milliseconds: u64, format: &str) -> String {
+    let separator = if format == "srt" { ',' } else { '.' };
+    format!(
+        "{:02}:{:02}:{:02}{separator}{:03}",
+        milliseconds / 3_600_000,
+        milliseconds / 60_000 % 60,
+        milliseconds / 1000 % 60,
+        milliseconds % 1000
+    )
+}
+
+fn subtitle_text(text: &str) -> String {
+    // Collapse payload line breaks so speech cannot inject extra cue blocks;
+    // escape markup so spoken angle brackets remain visible to subtitle players.
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn utc_date(timestamp_ms: u64) -> String {
@@ -392,6 +512,24 @@ mod tests {
         state["settings"]["jevEnabled"] = json!(false);
         state["settings"]["chatgptModel"] = json!("x".repeat(257));
         assert!(validate_state(&state).is_err());
+    }
+    #[test]
+    fn click_through_is_optional_for_older_settings_and_requires_a_boolean() {
+        let mut state = default_state();
+        assert_eq!(state["settings"]["clickThrough"], false);
+        state["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("clickThrough");
+        assert!(validate_state(&state).is_ok());
+        for enabled in [true, false] {
+            state["settings"]["clickThrough"] = json!(enabled);
+            assert!(validate_state(&state).is_ok());
+        }
+        for invalid in [json!("true"), json!(1), Value::Null] {
+            state["settings"]["clickThrough"] = invalid;
+            assert!(validate_state(&state).is_err());
+        }
     }
     #[test]
     fn background_preferences_and_assistance_mode_reject_unsafe_values() {
@@ -455,5 +593,95 @@ mod tests {
         assert!(output.contains("My answer."));
         assert!(output.contains("1m 5s"));
         assert_eq!(utc_date(86400000), "1970-01-02 00:00:00 UTC");
+    }
+
+    fn video_session() -> Value {
+        let mut video = session();
+        video["mode"] = json!("Video");
+        video["assistanceMode"] = json!("subtitles");
+        video["mediaStartedAt"] = json!(1_000_000);
+        video["mediaOffsetSeconds"] = json!(65.5);
+        video["transcript"] = json!([
+            {"id":"later","text":"Second line.","time":1_004_100,"source":"system","startMs":1_004_100,"endMs":1_005_300},
+            {"id":"typed","text":"This is my note, not speech.","time":1_001_000,"source":"typed","startMs":1_001_000,"endMs":1_002_000},
+            {"id":"first","text":"Use <three> & four.\n\nDo not inject --> cues.","time":1_000_250,"source":"system","startMs":1_000_250,"endMs":1_003_750},
+            {"id":"old","text":"Legacy untimed speech.","time":1_006_000,"source":"microphone"}
+        ]);
+        video
+    }
+
+    #[test]
+    fn subtitle_exports_sort_real_speech_apply_playhead_offset_and_escape_payloads() {
+        let video = video_session();
+        assert!(validate_session(&video).is_ok());
+        let srt = session_subtitles(&video, "srt").unwrap();
+        assert_eq!(srt, "1\n00:01:05,750 --> 00:01:09,250\nUse &lt;three&gt; &amp; four. Do not inject --&gt; cues.\n\n2\n00:01:09,600 --> 00:01:10,800\nSecond line.\n\n");
+        let vtt = session_subtitles(&video, "vtt").unwrap();
+        assert!(vtt.starts_with("WEBVTT\n\n1\n00:01:05.750 --> 00:01:09.250\n"));
+        assert!(!vtt.contains("my note"));
+        assert!(!vtt.contains("Legacy"));
+        assert!(session_subtitles(&video, "html").is_err());
+    }
+
+    #[test]
+    fn legacy_sessions_remain_valid_but_untimed_text_is_not_fabricated_as_subtitles() {
+        assert!(validate_session(&session()).is_ok());
+        assert!(session_subtitles(&session(), "srt")
+            .unwrap_err()
+            .contains("No timed speech"));
+        let mut video = video_session();
+        video.as_object_mut().unwrap().remove("mediaStartedAt");
+        video["mediaOffsetSeconds"] = json!(0);
+        let subtitles = session_subtitles(&video, "vtt").unwrap();
+        assert!(subtitles.contains("00:00:00.000 --> 00:00:03.500"));
+        assert!(subtitles.contains("00:00:03.850 --> 00:00:05.050"));
+    }
+
+    #[test]
+    fn timing_validation_rejects_incomplete_inverted_or_negative_intervals() {
+        let mut video = video_session();
+        video["transcript"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("endMs");
+        assert!(validate_session(&video).is_err());
+        video["transcript"][0]["endMs"] = json!(1_004_100);
+        assert!(validate_session(&video).is_err());
+        video["transcript"][0]["endMs"] = json!(1_005_300);
+        video["transcript"][0]["startMs"] = json!(-1);
+        assert!(validate_session(&video).is_err());
+        video = video_session();
+        video["mediaOffsetSeconds"] = json!(360_000);
+        assert!(validate_session(&video).is_err());
+        video["mediaOffsetSeconds"] = json!(-1);
+        assert!(validate_session(&video).is_err());
+    }
+
+    #[test]
+    fn subtitles_keep_silent_gaps_and_hour_boundaries_on_the_capture_clock() {
+        let mut video = video_session();
+        video["mediaOffsetSeconds"] = json!(3599.8);
+        video["transcript"] = json!([
+            {"id":"a","text":"One.","time":1_000_000,"source":"system","startMs":1_000_000,"endMs":1_000_400},
+            {"id":"b","text":"After silence.","time":1_010_000,"source":"system","startMs":1_010_000,"endMs":1_011_000}
+        ]);
+        let srt = session_subtitles(&video, "srt").unwrap();
+        assert!(srt.contains("00:59:59,800 --> 01:00:00,200"));
+        assert!(srt.contains("01:00:09,800 --> 01:00:10,800"));
+        video["mediaOffsetSeconds"] = json!(0);
+        video["mediaStartedAt"] = json!(1_000_200);
+        let vtt = session_subtitles(&video, "vtt").unwrap();
+        assert!(vtt.contains("00:00:00.000 --> 00:00:00.200"));
+        video["mediaStartedAt"] = json!(1_020_000);
+        assert!(session_subtitles(&video, "vtt").is_err());
+    }
+
+    #[test]
+    fn video_markdown_export_labels_saved_notes() {
+        let mut video = video_session();
+        video["summary"] = json!("## Key ideas\n\nThree steps.");
+        let markdown = session_markdown(&video).unwrap();
+        assert!(markdown.contains("- Mode: Video"));
+        assert!(markdown.contains("## Video notes\n\n## Key ideas"));
     }
 }

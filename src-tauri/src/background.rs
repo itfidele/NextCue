@@ -110,6 +110,7 @@ pub enum BackgroundActivity {
     Manual,
     Notes,
     Answers,
+    Subtitles,
 }
 
 fn activity_label(listening: bool, mode: BackgroundActivity) -> &'static str {
@@ -118,8 +119,9 @@ fn activity_label(listening: bool, mode: BackgroundActivity) -> &'static str {
     }
     match mode {
         BackgroundActivity::Manual => "NextCue · Listening",
-        BackgroundActivity::Notes => "NextCue · Listening · Meeting notes",
+        BackgroundActivity::Notes => "NextCue · Listening · Notes",
         BackgroundActivity::Answers => "NextCue · Listening · Question answers",
+        BackgroundActivity::Subtitles => "NextCue · Listening · Subtitles",
     }
 }
 
@@ -499,11 +501,16 @@ mod tests {
         );
         assert_eq!(
             activity_label(true, BackgroundActivity::Notes),
-            "NextCue · Listening · Meeting notes"
+            "NextCue · Listening · Notes"
         );
         assert_eq!(
             activity_label(true, BackgroundActivity::Answers),
             "NextCue · Listening · Question answers"
+        );
+        let subtitles = serde_json::from_value::<BackgroundActivity>(json!("subtitles")).unwrap();
+        assert_eq!(
+            activity_label(true, subtitles),
+            "NextCue · Listening · Subtitles"
         );
         assert!(serde_json::from_value::<BackgroundActivity>(json!("screen")).is_err());
     }

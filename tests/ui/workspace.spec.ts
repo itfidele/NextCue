@@ -8,6 +8,7 @@ async function bridge(page: Page) {
     let companionVisible = true;
     let companionConfig = {
       captureProtection: true,
+      clickThrough: false,
       answerShortcut: "CommandOrControl+Shift+Space",
       visibilityShortcut: "CommandOrControl+Shift+H",
       meetingShortcut: "CommandOrControl+Shift+M",
@@ -19,6 +20,7 @@ async function bridge(page: Page) {
         ? "unavailable"
         : "disabled",
       captureProtectionEnabled: companionConfig.captureProtection,
+      clickThrough: companionConfig.clickThrough,
       shortcutAvailable: true,
       visibilityShortcutAvailable: true,
       meetingShortcutAvailable: true,
@@ -38,8 +40,11 @@ async function bridge(page: Page) {
       detectionAvailable: true,
     });
     const emit = (name: string, event: any) => {
-      if (name === "companion-visibility")
+      if (name === "companion-visibility") {
         companionVisible = typeof event === "boolean" ? event : event.visible;
+        if (typeof event !== "boolean" && event.mode)
+          companionMode = event.mode;
+      }
       events[name]?.forEach((fn) => fn(event));
     };
     (window as any).__testEmit = emit;
@@ -50,6 +55,12 @@ async function bridge(page: Page) {
     (window as any).__testStopListeningCalls = 0;
     (window as any).__testStartListeningCalls = [];
     (window as any).__testStartListeningDelay = 0;
+    (window as any).__testStartListeningError = false;
+    (window as any).__testSubtitleExports = [];
+    (window as any).__testRuntimeStatus = JSON.parse(localStorage.getItem("test-runtime-status") || "null");
+    (window as any).__testInputDevices = JSON.parse(localStorage.getItem("test-input-devices") || "null") || [
+      { id: "system", name: "Mac system audio" },
+    ];
     (window as any).__testBackgroundConfigurations = [];
     (window as any).__testBackgroundActivity = [];
     (window as any).__testBackgroundReadyCalls = [];
@@ -94,6 +105,8 @@ async function bridge(page: Page) {
     };
     const pending = new Map<string, { reject: (e: Error) => void }>();
     let activeSession = "";
+    let activeSource = "microphone";
+    let audioStartedAt = 0;
     const blank = {
       sessions: [],
       settings: {
@@ -114,7 +127,7 @@ async function bridge(page: Page) {
         if ((window as any).__testRuntimeDelay)
           await new Promise((resolve) => setTimeout(resolve, (window as any).__testRuntimeDelay));
         (window as any).__testRuntimeResolved = true;
-        return {
+        return (window as any).__testRuntimeStatus || {
           ollama: true,
           models: [{ name: "qwen2.5:7b-instruct", size: 4683000000 }],
           transcription: true,
@@ -212,14 +225,18 @@ async function bridge(page: Page) {
         pending.delete(id);
       },
       onToken: (fn: Callback) => on("token", fn),
-      inputDevices: async () => [{ id: "system", name: "Mac system audio" }],
+      inputDevices: async () => (window as any).__testInputDevices,
       startListening: async (request: any) => {
         (window as any).__testStartListeningCalls.push(request);
+        if ((window as any).__testStartListeningError)
+          throw new Error("Audio capture permission was denied.");
         if ((window as any).__testStartListeningDelay)
           await new Promise((resolve) =>
             setTimeout(resolve, (window as any).__testStartListeningDelay),
           );
         activeSession = request.sessionId;
+        activeSource = request.source;
+        audioStartedAt = Date.now();
         (window as any).__testActiveSession = activeSession;
         emit("status", { sessionId: activeSession, listening: true });
       },
@@ -230,8 +247,10 @@ async function bridge(page: Page) {
         emit("transcript", {
           sessionId: activeSession,
           text: "The final audio segment.",
-          source: "microphone",
-          time: Date.now(),
+          source: activeSource,
+          time: audioStartedAt + 1000,
+          startMs: audioStartedAt + 1000,
+          endMs: audioStartedAt + 2300,
         });
         activeSession = "";
       },
@@ -241,6 +260,13 @@ async function bridge(page: Page) {
       onVoiceProgress: (fn: Callback) => on("progress", fn),
       setupVoice: async () => {},
       exportSession: async () => true,
+      exportSubtitles: async (session: any, format: string) => {
+        (window as any).__testSubtitleExports.push({
+          session: JSON.parse(JSON.stringify(session)),
+          format,
+        });
+        return true;
+      },
       importContext: async () => null,
       setAlwaysOnTop: async () => {},
       setCompanionMode: async (mode: string) => {
@@ -355,6 +381,40 @@ async function heard(page: Page, text: string) {
       time: Date.now(),
     });
   }, text);
+}
+async function createVideo(
+  page: Page,
+  title: string,
+  options: { offsetSeconds?: number; context?: string; fromHome?: boolean } = {},
+) {
+  if (options.fromHome) {
+    await page.getByRole("button", { name: "Video notes and subtitles", exact: false }).click();
+  } else {
+    await page.getByRole("button", { name: "New session", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Video", exact: true }).click();
+  }
+  const dialog = page.getByRole("dialog");
+  await dialog.getByLabel("Session title", { exact: true }).fill(title);
+  await dialog.getByLabel("Learning objective", { exact: false }).fill("Understand the video");
+  if (options.offsetSeconds !== undefined)
+    await dialog.getByLabel("Video starting position (seconds)", { exact: false }).fill(String(options.offsetSeconds));
+  if (options.context) {
+    await dialog.locator("summary").filter({ hasText: "Personalize notes" }).click();
+    await dialog.getByLabel("Video background", { exact: false }).fill(options.context);
+  }
+  await dialog.getByRole("button", { name: "Create session", exact: true }).click();
+  await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
+}
+async function heardVideo(page: Page, text: string, startMs: number, endMs: number) {
+  await page.evaluate(
+    (event) => (window as any).__testEmit("transcript", {
+      sessionId: (window as any).__testActiveSession,
+      source: "system",
+      time: event.startMs,
+      ...event,
+    }),
+    { text, startMs, endMs },
+  );
 }
 async function backgroundAction(
   page: Page,
@@ -1327,6 +1387,7 @@ test("custom assistant shortcuts and capture preferences apply and survive reloa
     .click();
   const configured = {
     captureProtection: false,
+    clickThrough: false,
     answerShortcut: "CommandOrControl+Alt+A",
     visibilityShortcut: "CommandOrControl+Alt+H",
     meetingShortcut: "CommandOrControl+Alt+M",
@@ -1345,6 +1406,7 @@ test("custom assistant shortcuts and capture preferences apply and survive reloa
         if (!settings) return null;
         return {
           captureProtection: settings.captureProtection,
+          clickThrough: settings.clickThrough,
           answerShortcut: settings.answerShortcut,
           visibilityShortcut: settings.visibilityShortcut,
           meetingShortcut: settings.meetingShortcut,
@@ -1588,6 +1650,7 @@ test("a startup shortcut conflict restores accepted native settings and keeps th
 }) => {
   const requested = {
     captureProtection: false,
+    clickThrough: true,
     answerShortcut: "CommandOrControl+Alt+A",
     visibilityShortcut: "CommandOrControl+Alt+H",
     meetingShortcut: "CommandOrControl+Alt+M",
@@ -1619,6 +1682,7 @@ test("a startup shortcut conflict restores accepted native settings and keeps th
       exact: true,
     }),
   ).toHaveAttribute("aria-checked", "true");
+  await expect(page.getByRole("switch", { name: "Allow clicks through floating assistant", exact: true })).toHaveAttribute("aria-checked", "false");
   await expect(
     page.getByLabel("Show answer shortcut", { exact: true }),
   ).toHaveValue(requested.answerShortcut);
@@ -1647,6 +1711,7 @@ test("a startup shortcut conflict restores accepted native settings and keeps th
         if (!settings) return null;
         return {
           captureProtection: settings.captureProtection,
+          clickThrough: settings.clickThrough,
           answerShortcut: settings.answerShortcut,
           visibilityShortcut: settings.visibilityShortcut,
         };
@@ -1654,6 +1719,7 @@ test("a startup shortcut conflict restores accepted native settings and keeps th
     )
     .toEqual({
       captureProtection: true,
+      clickThrough: false,
       answerShortcut: "CommandOrControl+Shift+Space",
       visibilityShortcut: "CommandOrControl+Shift+H",
     });
@@ -2000,4 +2066,451 @@ test("Meeting notes send full source-labelled context and meeting metadata at a 
     path: "/private/tmp/nextcue-meeting-notes.png",
     fullPage: false,
   });
+});
+
+test("the video home card creates a notes session and captures Mac system audio", async ({ page }) => {
+  await createVideo(page, "YouTube tutorial", {
+    fromHome: true,
+    offsetSeconds: 90,
+    context: "A browser tutorial about reliable deployments.",
+  });
+  await expect(page.getByRole("button", { name: "Notes", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls[0])).toMatchObject({
+    source: "system",
+  });
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0],
+  )).toMatchObject({
+    title: "YouTube tutorial",
+    mode: "Video",
+    assistanceMode: "notes",
+    mediaOffsetSeconds: 90,
+    context: "A browser tutorial about reliable deployments.",
+  });
+  expect(await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state")!).sessions[0].mediaStartedAt,
+  )).toEqual(expect.any(Number));
+});
+
+test("video subtitles listen and retain final audio without an AI provider", async ({ page }) => {
+  await page.evaluate(() => {
+    localStorage.setItem("test-runtime-status", JSON.stringify({
+      ollama: false,
+      models: [],
+      transcription: true,
+      platform: "macos",
+    }));
+  });
+  await page.reload();
+  await createVideo(page, "Captions without AI");
+  await page.getByRole("button", { name: "Subtitles", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Subtitles", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+  const startMs = Date.now();
+  await heardVideo(page, "How do we add subtitles to a YouTube video?", startMs, startMs + 2400);
+  await expect(page.getByLabel("Latest caption", { exact: true })).toContainText("How do we add subtitles");
+  await page.waitForTimeout(1500);
+  await page.getByRole("button", { name: "Pause listening", exact: true }).click();
+  await expect(page.getByLabel("Video transcript", { exact: true })).toContainText("The final audio segment.");
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0]?.transcript?.at(-1)?.text,
+  )).toBe("The final audio segment.");
+});
+
+test("video notes and subtitles suppress spoken auto answers even when enabled globally", async ({ page }) => {
+  await page.clock.install();
+  await page.evaluate(async () => {
+    const saved = await (window as any).desktop.getState();
+    saved.settings.autoAnswer = true;
+    localStorage.setItem("test-state", JSON.stringify(saved));
+  });
+  await page.reload();
+  await createVideo(page, "Learning from a lecture");
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  await heard(page, "How do we reduce deployment risk? Use a small initial rollout.");
+  await page.clock.runFor(1600);
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  await page.clock.fastForward(61_000);
+  await expect.poll(() => page.evaluate(() => (window as any).__testRequests.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).__testRequests[0])).toMatchObject({
+    kind: "summary",
+    sessionMode: "Video",
+    sessionTitle: "Learning from a lecture",
+  });
+  await page.clock.runFor(600);
+  await page.getByRole("button", { name: "Subtitles", exact: true }).click();
+  await heard(page, "Why do we monitor error rates after every rollout?");
+  await page.clock.fastForward(61_000);
+  expect(await page.evaluate(() =>
+    (window as any).__testRequests.map((request: any) => request.kind),
+  )).toEqual(["summary"]);
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0]?.summary,
+  )).toBe("A grounded answer based on your background.");
+});
+
+test("video subtitle exports flush final audio and retain timing and video position after reload", async ({ page }) => {
+  await createVideo(page, "Timed browser captions", { offsetSeconds: 120 });
+  await page.getByRole("button", { name: "Subtitles", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Export SRT", exact: true })).toBeDisabled();
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  const sessionId = await page.evaluate(() => (window as any).__testActiveSession);
+  const startMs = Date.now();
+  await heardVideo(page, "The first timed caption.", startMs, startMs + 2500);
+  await expect(page.getByRole("button", { name: "Export SRT", exact: true })).toBeEnabled();
+  const stopsBeforeExport = await page.evaluate(() => (window as any).__testStopListeningCalls);
+  await page.getByRole("button", { name: "Export SRT", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__testSubtitleExports.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).__testStopListeningCalls)).toBe(stopsBeforeExport + 1);
+  const firstExport = await page.evaluate(() => (window as any).__testSubtitleExports[0]);
+  expect(firstExport).toMatchObject({
+    format: "srt",
+    session: { id: sessionId, mode: "Video", mediaOffsetSeconds: 120 },
+  });
+  expect(firstExport.session.mediaStartedAt).toEqual(expect.any(Number));
+  expect(firstExport.session.transcript).toEqual(expect.arrayContaining([
+    expect.objectContaining({ text: "The first timed caption.", source: "system", time: startMs, startMs, endMs: startMs + 2500 }),
+    expect.objectContaining({ text: "The final audio segment.", source: "system", startMs: expect.any(Number), endMs: expect.any(Number) }),
+  ]));
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0]?.transcript?.length,
+  )).toBe(2);
+  await page.reload();
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  await page.getByRole("button", { name: "Open", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Export VTT", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Export VTT", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__testSubtitleExports.length)).toBe(1);
+  const secondExport = await page.evaluate(() => (window as any).__testSubtitleExports[0]);
+  expect(secondExport.format).toBe("vtt");
+  expect(secondExport.session).toMatchObject({
+    id: sessionId,
+    mediaStartedAt: firstExport.session.mediaStartedAt,
+    mediaOffsetSeconds: 120,
+    transcript: firstExport.session.transcript,
+  });
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+});
+
+test("video notes use the video transcript including audio flushed when paused", async ({ page }) => {
+  await createVideo(page, "Deployment video notes", {
+    context: "Explain the deployment walkthrough and its main takeaways.",
+  });
+  await page.getByRole("button", { name: "Subtitles", exact: true }).click();
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  const startMs = Date.now();
+  await heardVideo(page, "Start with a small canary rollout, then check the error rate.", startMs, startMs + 3000);
+  await page.getByRole("button", { name: "Pause listening", exact: true }).click();
+  await expect(page.getByLabel("Video transcript", { exact: true })).toContainText("The final audio segment.");
+  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  await page.getByRole("button", { name: "Create video notes", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__testRequests.length)).toBe(1);
+  const request = await page.evaluate(() => (window as any).__testRequests[0]);
+  expect(request).toMatchObject({
+    kind: "summary",
+    sessionMode: "Video",
+    sessionTitle: "Deployment video notes",
+    context: "Explain the deployment walkthrough and its main takeaways.",
+  });
+  expect(request.transcript).toContain("System audio: Start with a small canary rollout");
+  expect(request.transcript).toContain("The final audio segment.");
+  await expect(page.locator(".markdown")).toContainText("A grounded answer based on your background.");
+  await expect(page.getByRole("button", { name: "Update video notes", exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0]?.summary,
+  )).toBe("A grounded answer based on your background.");
+  for (const viewport of [
+    { width: 1440, height: 1000, path: "test-results/video-desktop.png" },
+    { width: 1120, height: 800, path: "test-results/video-native-window.png" },
+  ]) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await page.screenshot({ path: viewport.path, animations: "disabled" });
+  }
+});
+
+test("video floating captions keep capture alive and pin clicks and shortcuts never answer speech", async ({ page }) => {
+  await page.evaluate(async () => {
+    const saved = await (window as any).desktop.getState();
+    saved.settings.autoAnswer = true;
+    localStorage.setItem("test-state", JSON.stringify(saved));
+  });
+  await page.reload();
+  await createVideo(page, "Floating lecture captions");
+  await page.getByRole("button", { name: "Subtitles", exact: true }).click();
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  const sessionId = await page.evaluate(() => (window as any).__testActiveSession);
+  const stopsBeforePin = await page.evaluate(() => (window as any).__testStopListeningCalls);
+  const startMs = Date.now();
+  await heardVideo(page, "How does the first rollout reduce risk?", startMs, startMs + 1800);
+  await page.getByRole("button", { name: "Pin mode", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Show video assistant", exact: true })).toBeVisible();
+  await heardVideo(page, "Why do we compare the error rate with the baseline?", startMs + 2000, startMs + 4500);
+  await page.getByRole("button", { name: "Show video assistant", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Latest caption", exact: true })).toContainText("Why do we compare the error rate");
+  await expect(page.locator(".companion-state")).toContainText("Listening");
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Get answer", exact: true })).toHaveCount(0);
+  await page.evaluate(() => (window as any).__testEmit("companion-toggle", null));
+  await expect(page.getByRole("button", { name: "Show video assistant", exact: true })).toBeVisible();
+  await heardVideo(page, "What is the next step after a healthy canary rollout?", startMs + 5000, startMs + 7300);
+  await page.evaluate(() => (window as any).__testEmit("companion-toggle", null));
+  await expect(page.getByRole("region", { name: "Latest caption", exact: true })).toContainText("What is the next step");
+  await page.getByRole("button", { name: "Open full app", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Floating lecture captions", exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Video transcript", exact: true })).toContainText("How does the first rollout");
+  await expect(page.getByRole("region", { name: "Video transcript", exact: true })).toContainText("Why do we compare the error rate");
+  await expect(page.getByRole("region", { name: "Video transcript", exact: true })).toContainText("What is the next step");
+  await page.waitForTimeout(1500);
+  expect(await page.evaluate(() => ({
+    activeSession: (window as any).__testActiveSession,
+    starts: (window as any).__testStartListeningCalls.length,
+    stops: (window as any).__testStopListeningCalls,
+    requests: (window as any).__testRequests,
+    modes: (window as any).__testCompanionModes,
+  }))).toEqual({
+    activeSession: sessionId,
+    starts: 1,
+    stops: stopsBeforePin,
+    requests: [],
+    modes: ["pin", "answer", "pin", "answer", "main"],
+  });
+  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  await page.getByRole("button", { name: "Pin mode", exact: true }).click();
+  await page.getByRole("button", { name: "Show video assistant", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Create video notes", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  await page.evaluate(() => (window as any).__testEmit("companion-toggle", null));
+  await expect(page.getByRole("button", { name: "Show video assistant", exact: true })).toBeVisible();
+  await page.evaluate(() => (window as any).__testEmit("companion-toggle", null));
+  await expect(page.getByRole("button", { name: "Open full app", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  expect(await page.evaluate(() => (window as any).__testStopListeningCalls)).toBe(stopsBeforePin);
+});
+
+test("pausing video notes waits for an in-flight summary and refreshes it with the final audio", async ({ page }) => {
+  await createVideo(page, "Final lecture notes");
+  await page.evaluate(() => ((window as any).__testChatDelay = 800));
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  const startMs = Date.now();
+  await heardVideo(page, "Begin with a small canary rollout.", startMs, startMs + 2200);
+  await page.getByRole("button", { name: "Create video notes", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__testRequests.length)).toBe(1);
+  await heardVideo(page, "Expand the rollout only when the error rate remains stable.", startMs + 2400, startMs + 5300);
+  await page.getByRole("button", { name: "Pause listening", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__testRequests.length)).toBe(2);
+  const requests = await page.evaluate(() => (window as any).__testRequests);
+  expect(requests.map((request: any) => ({ kind: request.kind, sessionMode: request.sessionMode }))).toEqual([
+    { kind: "summary", sessionMode: "Video" },
+    { kind: "summary", sessionMode: "Video" },
+  ]);
+  expect(requests[0].transcript).toContain("Begin with a small canary rollout.");
+  expect(requests[0].transcript).not.toContain("The final audio segment.");
+  expect(requests[1].transcript).toContain("Begin with a small canary rollout.");
+  expect(requests[1].transcript).toContain("Expand the rollout only when the error rate remains stable.");
+  expect(requests[1].transcript).toContain("The final audio segment.");
+  await expect(page.locator(".markdown.streaming")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Start listening", exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0]?.summary,
+  )).toBe("A grounded answer based on your background.");
+});
+
+for (const platform of ["windows", "linux"]) {
+  test(`video capture on ${platform} requires an explicitly selected loopback input`, async ({ page }) => {
+    await page.evaluate(async (platform) => {
+      const saved = await (window as any).desktop.getState();
+      saved.settings.inputDevice = platform === "windows" ? "hardware-mic" : "";
+      saved.settings.audioSource = "microphone";
+      localStorage.setItem("test-state", JSON.stringify(saved));
+      localStorage.setItem("test-runtime-status", JSON.stringify({
+        ollama: true,
+        models: [{ name: "qwen2.5:7b-instruct", size: 4683000000 }],
+        transcription: true,
+        platform,
+      }));
+      localStorage.setItem("test-input-devices", JSON.stringify([
+        { id: "hardware-mic", name: "Laptop microphone" },
+        { id: "browser-loopback", name: "Browser playback loopback" },
+      ]));
+    }, platform);
+    await page.reload();
+    await createVideo(page, `${platform} browser video`);
+    await page.getByRole("button", { name: "Subtitles", exact: true }).click();
+    await page.getByRole("button", { name: "Start listening", exact: true }).click();
+    await expect(page.getByText("Route browser audio to a loopback or virtual input, then choose it in Audio input device.", { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toEqual([]);
+    await page.getByLabel("Audio input device", { exact: true }).selectOption("browser-loopback");
+    await page.getByRole("button", { name: "Start listening", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+    expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toEqual([
+      expect.objectContaining({ source: "microphone", device: "browser-loopback" }),
+    ]);
+    expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  });
+}
+
+test("taking meeting notes in background hides the window while capture and automatic notes continue", async ({ page }) => {
+  await page.clock.install();
+  await page.evaluate(async () => {
+    const saved = await (window as any).desktop.getState();
+    saved.settings.autoAnswer = true;
+    localStorage.setItem("test-state", JSON.stringify(saved));
+  });
+  await page.reload();
+  await create(page, "Zoom background notes", { mode: "Meeting" });
+  await expect(page.getByRole("switch", { name: "Auto suggestions", exact: true })).toHaveAttribute("aria-checked", "true");
+  const stopsBeforeNotes = await page.evaluate(() => (window as any).__testStopListeningCalls);
+  await page.getByRole("button", { name: "Take notes in background", exact: true }).click();
+  await expect(page.locator(".assistant-hidden")).toHaveAttribute("aria-hidden", "true");
+  await expect(page.locator(".live-page, .companion-card, .companion-pin, textarea")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as any).__testStartListeningCalls.length)).toBe(1);
+  const sessionId = await page.evaluate(() => (window as any).__testActiveSession);
+  expect(await page.evaluate(() => (window as any).__testCompanionVisibilityCalls)).toEqual([false]);
+  await heard(page, "How should we roll this out? We agreed to start with ten percent on Monday.");
+  await page.clock.runFor(1600);
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+  await page.clock.fastForward(61_000);
+  await expect.poll(() => page.evaluate(() => (window as any).__testRequests.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).__testRequests[0])).toMatchObject({
+    kind: "summary",
+    sessionMode: "Meeting",
+    sessionTitle: "Zoom background notes",
+  });
+  await page.clock.runFor(1500);
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0],
+  )).toMatchObject({
+    id: sessionId,
+    assistanceMode: "notes",
+    summary: "A grounded answer based on your background.",
+    transcript: [expect.objectContaining({ text: "How should we roll this out? We agreed to start with ten percent on Monday." })],
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).__testBackgroundActivity.at(-1))).toMatchObject({ listening: true, mode: "notes" });
+  await backgroundAction(page, "show");
+  await expect(page.locator(".assistant-hidden")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Zoom background notes", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+  await expect(page.locator(".markdown")).toContainText("A grounded answer based on your background.");
+  expect(await page.evaluate(() => ({
+    active: (window as any).__testActiveSession,
+    starts: (window as any).__testStartListeningCalls.length,
+    stops: (window as any).__testStopListeningCalls,
+    sessions: JSON.parse(localStorage.getItem("test-state")!).sessions.length,
+  }))).toEqual({ active: sessionId, starts: 1, stops: stopsBeforeNotes, sessions: 1 });
+});
+
+test("taking notes from the floating meeting assistant hides the pin without stopping audio", async ({ page }) => {
+  await create(page, "Floating Zoom meeting", { mode: "Meeting" });
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  const before = await page.evaluate(() => ({
+    active: (window as any).__testActiveSession,
+    stops: (window as any).__testStopListeningCalls,
+  }));
+  await page.getByRole("button", { name: "Pin mode", exact: true }).click();
+  await page.getByRole("button", { name: "Show answer", exact: true }).click();
+  await page.getByRole("button", { name: "Take notes in background", exact: true }).click();
+  await expect(page.locator(".assistant-hidden")).toHaveAttribute("aria-hidden", "true");
+  await expect(page.locator(".companion-card, .companion-pin")).toHaveCount(0);
+  await heard(page, "Sam will prepare the rollout checklist after this call.");
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.[0]?.transcript?.at(-1)?.text,
+  )).toBe("Sam will prepare the rollout checklist after this call.");
+  expect(await page.evaluate(() => (window as any).__testCompanionVisibilityCalls)).toEqual([false]);
+  await backgroundAction(page, "show");
+  await expect(page.getByRole("heading", { name: "Floating Zoom meeting", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+  await expect(page.getByRole("switch", { name: "Auto suggestions", exact: true })).toHaveAttribute("aria-checked", "false");
+  expect(await page.evaluate(() => ({
+    active: (window as any).__testActiveSession,
+    stops: (window as any).__testStopListeningCalls,
+    starts: (window as any).__testStartListeningCalls.length,
+    requests: (window as any).__testRequests,
+  }))).toEqual({ active: before.active, stops: before.stops, starts: 1, requests: [] });
+});
+
+test("failed background note capture keeps the meeting window visible", async ({ page }) => {
+  await create(page, "Capture failure stays visible", { mode: "Meeting" });
+  await page.evaluate(() => ((window as any).__testStartListeningError = true));
+  await page.getByRole("button", { name: "Take notes in background", exact: true }).click();
+  await expect(page.getByText("Audio capture permission was denied.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Capture failure stays visible", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start listening", exact: true })).toBeVisible();
+  await expect(page.locator(".assistant-hidden")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__testStartListeningCalls.length)).toBe(1);
+  expect(await page.evaluate(() => (window as any).__testCompanionVisibilityCalls)).toEqual([]);
+  expect(await page.evaluate(() => (window as any).__testActiveSession || "")).toBe("");
+  expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
+});
+
+test("floating click-through settings persist and a failed native change preserves the accepted preference", async ({ page }) => {
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const clickThrough = page.getByRole("switch", { name: "Allow clicks through floating assistant", exact: true });
+  await expect(clickThrough).toHaveAttribute("aria-checked", "false");
+  await clickThrough.click();
+  await expect(clickThrough).toHaveAttribute("aria-checked", "true");
+  await expect.poll(() => page.evaluate(() => (window as any).__testCompanionConfigurations.at(-1))).toMatchObject({ clickThrough: true });
+  await expect.poll(() => page.evaluate(() =>
+    JSON.parse(localStorage.getItem("test-state") || "null")?.settings?.clickThrough,
+  )).toBe(true);
+  await page.reload();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(clickThrough).toHaveAttribute("aria-checked", "true");
+  await expect.poll(() => page.evaluate(() => (window as any).__testCompanionConfigurations.at(-1))).toMatchObject({ clickThrough: true });
+  const acceptedSettings = await page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!).settings);
+  await page.evaluate(() => ((window as any).__testConfigureError = true));
+  await clickThrough.click();
+  await expect(page.getByRole("alert")).toContainText("Shortcut is already used by another app.");
+  await expect(clickThrough).toHaveAttribute("aria-checked", "true");
+  expect(await page.evaluate(() => (window as any).__testCompanionConfigurations.at(-1))).toMatchObject({ clickThrough: false });
+  await page.waitForTimeout(650);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("test-state")!).settings)).toEqual(acceptedSettings);
+  await page.evaluate(() => ((window as any).__testConfigureError = false));
+  await page.reload();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(clickThrough).toHaveAttribute("aria-checked", "true");
+});
+
+test("native visibility recovery restores the full app from a hidden click-through pin without pausing capture", async ({ page }) => {
+  await page.evaluate(async () => {
+    const saved = await (window as any).desktop.getState();
+    saved.settings.clickThrough = true;
+    localStorage.setItem("test-state", JSON.stringify(saved));
+  });
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => (window as any).__testCompanionConfigurations.at(-1))).toMatchObject({ clickThrough: true });
+  await create(page, "Native visibility recovery", { mode: "Meeting" });
+  await page.getByRole("button", { name: "Start listening", exact: true }).click();
+  const before = await page.evaluate(() => ({
+    active: (window as any).__testActiveSession,
+    stops: (window as any).__testStopListeningCalls,
+  }));
+  await page.getByRole("button", { name: "Pin mode", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Show answer", exact: true })).toBeVisible();
+  await page.evaluate(() => (window as any).__testEmit("companion-visibility", { visible: false }));
+  await expect(page.locator(".assistant-hidden")).toHaveAttribute("aria-hidden", "true");
+  await heard(page, "The meeting transcript continues while the click-through pin is hidden.");
+  const readsBeforeRecovery = await page.evaluate(() => (window as any).__testCompanionStatusReads);
+  await page.evaluate(() => (window as any).__testEmit("companion-visibility", {
+    visible: true,
+    mode: "main",
+    clickThrough: true,
+  }));
+  await expect(page.getByRole("heading", { name: "Native visibility recovery", exact: true })).toBeVisible();
+  await expect(page.locator(".assistant-hidden, .companion-pin, .companion-card")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Pause listening", exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as any).__testCompanionStatusReads)).toBeGreaterThan(readsBeforeRecovery);
+  await page.getByRole("button", { name: /^Transcript/ }).click();
+  await expect(page.getByText("The meeting transcript continues while the click-through pin is hidden.", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => ({
+    active: (window as any).__testActiveSession,
+    stops: (window as any).__testStopListeningCalls,
+    starts: (window as any).__testStartListeningCalls.length,
+    requests: (window as any).__testRequests,
+    modes: (window as any).__testCompanionModes,
+  }))).toEqual({ active: before.active, stops: before.stops, starts: 1, requests: [], modes: ["pin"] });
 });

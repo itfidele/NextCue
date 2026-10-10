@@ -25,7 +25,7 @@ pub fn validate_request(request: &ChatRequest) -> Result<(), String> {
     if request
         .session_mode
         .as_deref()
-        .is_some_and(|mode| !["Interview", "Practice", "Meeting"].contains(&mode))
+        .is_some_and(|mode| !["Interview", "Practice", "Meeting", "Video"].contains(&mode))
     {
         return Err("Invalid session mode.".into());
     }
@@ -64,6 +64,12 @@ pub fn prompts(request: &ChatRequest) -> (String, String) {
     let summary = request.kind.as_deref() == Some("summary");
     let mode = request.session_mode.as_deref().unwrap_or("Interview");
     let purpose = match (mode, summary) {
+        ("Video", true) => {
+            "Write concise study notes from the captured portion of a video's spoken audio. Organize supported content into a short overview, key ideas, useful examples, and takeaways. Preserve stated names and numbers accurately and flag unclear or incomplete passages. Treat the speaker's claims as claims, rather than independently verified facts. Do not invent visual details, chapters, quotations, events, or material from parts of the video that were not captured. Include timestamps only when supplied in the transcript. Do not evaluate the user's interview performance or turn the video's statements into the user's personal experience. Use brief Markdown headings and bullets."
+        }
+        ("Video", false) => {
+            "Answer the user's question about the captured video audio using the supplied transcript and background. Distinguish what the speaker said from your own explanation. Acknowledge material that was not captured or cannot be determined from audio alone. Do not invent visual details, quotations, or the user's personal experience. Keep the response concise and useful for learning."
+        }
         ("Meeting", true) => {
             "Write concise meeting notes from the supplied discussion and background. Organize supported content into topics, confirmed decisions, action items, and open questions. Include an action item's owner and deadline only when explicitly stated; otherwise mark the owner as unassigned or the deadline as unknown. Distinguish proposals from agreed decisions. Do not invent attendees, commitments, facts, or events. Use brief Markdown headings and bullets."
         }
@@ -92,10 +98,10 @@ pub fn prompts(request: &ChatRequest) -> (String, String) {
         }
     }
     let task = if summary {
-        if mode == "Meeting" {
-            "Summarize this meeting."
-        } else {
-            "Summarize this session."
+        match mode {
+            "Video" => "Create notes from the captured video audio.",
+            "Meeting" => "Summarize this meeting.",
+            _ => "Summarize this session.",
         }
     } else {
         &request.question
@@ -105,7 +111,9 @@ pub fn prompts(request: &ChatRequest) -> (String, String) {
     } else {
         "RECENT TRANSCRIPT"
     };
-    let output = if summary && mode == "Meeting" {
+    let output = if summary && mode == "Video" {
+        "video notes"
+    } else if summary && mode == "Meeting" {
         "meeting notes"
     } else if summary {
         "recap"
@@ -187,6 +195,30 @@ mod tests {
         assert!(!system.contains("Write in first person"));
         assert!(user.contains(&request.context));
         assert!(user.contains("RECENT TRANSCRIPT"));
+    }
+
+    #[test]
+    fn video_notes_use_only_captured_audio_without_inventing_visuals_or_personal_facts() {
+        let mut request = request();
+        request.kind = Some("summary".into());
+        request.session_mode = Some("Video".into());
+        request.question.clear();
+        request.transcript = "System audio [00:12]: Our example uses three steps.".into();
+        assert!(validate_request(&request).is_ok());
+        let (system, user) = prompts(&request);
+        assert!(system.contains("captured portion of a video's spoken audio"));
+        assert!(system.contains("Do not invent visual details"));
+        assert!(system.contains("claims, rather than independently verified facts"));
+        assert!(system.contains("timestamps only when supplied"));
+        assert!(!system.contains("STAR"));
+        assert!(user.contains("FULL SESSION TRANSCRIPT"));
+        assert!(user.contains(&request.transcript));
+        assert!(user.contains("Respond directly with the video notes."));
+        request.kind = Some("answer".into());
+        request.question = "What were those steps?".into();
+        let (system, user) = prompts(&request);
+        assert!(system.contains("user's question about the captured video audio"));
+        assert!(user.contains(&request.question));
     }
 
     #[test]

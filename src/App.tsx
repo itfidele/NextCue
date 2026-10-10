@@ -46,6 +46,8 @@ import {
   Square,
   Trash2,
   Upload,
+  Video,
+  Captions,
   X,
   Zap,
 } from "lucide-react";
@@ -116,6 +118,12 @@ const modelLabel = (name: string) =>
     .replace("qwen2.5", "Qwen 2.5")
     .replace("phi4-mini", "Phi-4 Mini")
     .replace("llama3.1", "Llama 3.1");
+const notesPrompt = (session?: InterviewSession) =>
+  session?.mode === "Video" ? "Create video notes from the captured transcript." : "Create meeting notes.";
+const mediaTime = (session: InterviewSession, epochMs: number) => {
+  const seconds = Math.max(0, Math.floor((epochMs - (session.mediaStartedAt ?? epochMs)) / 1000 + (session.mediaOffsetSeconds ?? 0)));
+  return `${Math.floor(seconds / 3600).toString().padStart(2, "0")}:${duration(seconds % 3600)}`;
+};
 
 function Modal({
   children,
@@ -243,6 +251,7 @@ export default function App() {
     status: "",
   });
   const [devices, setDevices] = useState<InputDevice[]>([]);
+  const [videoInputs, setVideoInputs] = useState<Record<string, string>>({});
   const [question, setQuestion] = useState("");
   const [generating, setGenerating] = useState(false);
   const [streamText, setStreamText] = useState("");
@@ -252,6 +261,8 @@ export default function App() {
     captureProtection: "unavailable",
   });
   const [companionBusy, setCompanionBusy] = useState(false);
+  const [backgroundNotesBusy, setBackgroundNotesBusy] = useState(false);
+  const backgroundNotesBusyRef = useRef(false);
   const [shortcutDraft, setShortcutDraft] = useState({
     answerShortcut: defaults.settings.answerShortcut!,
     visibilityShortcut: defaults.settings.visibilityShortcut!,
@@ -279,6 +290,7 @@ export default function App() {
   const pendingMeetingHintRef = useRef<MeetingHint | null>(null);
   const notesWatermarkRef = useRef<Record<string, number>>({});
   const companionBusyRef = useRef(false);
+  const companionVisibilityRevisionRef = useRef(0);
   const [detailsTab, setDetailsTab] = useState<"transcript" | "context" | null>(
     null,
   );
@@ -290,6 +302,7 @@ export default function App() {
     mode: "Interview" as SessionMode,
     context: "",
     instructions: "",
+    mediaOffsetSeconds: "0",
   });
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -305,6 +318,7 @@ export default function App() {
   const loadedRef = useRef(loaded);
   loadedRef.current = loaded;
   const requestRef = useRef<{ id: string; sessionId: string } | null>(null);
+  const requestCompletionRef = useRef<{ id: string; promise: Promise<void> } | null>(null);
   const autoTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -329,6 +343,7 @@ export default function App() {
     setState((s) => ({ ...s, settings: { ...s.settings, ...patch } }));
   const autoAnswersEnabled = (sessionId: string) => {
     const session = stateRef.current.sessions.find((s) => s.id === sessionId);
+    if (session?.mode === "Video" || session?.assistanceMode === "subtitles") return false;
     return session?.assistanceMode === "answers" ||
       (session?.assistanceMode !== "notes" && session?.assistanceMode !== "manual" &&
         stateRef.current.settings.autoAnswer);
@@ -507,6 +522,7 @@ export default function App() {
     );
     if (!session || requestRef.current || (!q.trim() && kind === "answer"))
       return;
+    if (kind === "answer" && (session.mode === "Video" || session.assistanceMode === "subtitles")) return;
     if (kind === "answer" && byteLength(q.trim()) > 16000) {
       notify("Shorten the question before requesting an answer.");
       return;
@@ -555,7 +571,7 @@ export default function App() {
     )
       .map(
         (t) =>
-          `${t.source === "system" ? "System audio" : t.source === "microphone" ? "Microphone" : "Typed"}: ${t.text}`,
+          `${session.mode === "Video" && t.startMs !== undefined && session.mediaStartedAt !== undefined ? `[${mediaTime(session, t.startMs)}] ` : ""}${t.source === "system" ? "System audio" : t.source === "microphone" ? "Microphone" : "Typed"}: ${t.text}`,
       )
       .join("\n");
     if (byteLength(transcript) > 120000) {
@@ -566,6 +582,9 @@ export default function App() {
     }
     const id = uid();
     requestRef.current = { id, sessionId: session.id };
+    let completeRequest!: () => void;
+    const completion = new Promise<void>((resolve) => { completeRequest = resolve; });
+    requestCompletionRef.current = { id, promise: completion };
     setGenerating(true);
     setStreamText("");
     setContextInsight("");
@@ -595,7 +614,7 @@ export default function App() {
               ? "default"
               : stateRef.current.settings.model,
         provider,
-        sessionMode: kind === "summary" && session.assistanceMode === "notes" ? "Meeting" : session.mode,
+        sessionMode: kind === "summary" && session.assistanceMode === "notes" && session.mode !== "Video" ? "Meeting" : session.mode,
         sessionTitle: session.title,
         role: session.role,
         company: session.company,
@@ -691,6 +710,8 @@ export default function App() {
           );
         }
       }
+      if (requestCompletionRef.current?.id === id) requestCompletionRef.current = null;
+      completeRequest();
     }
   }
   const generateRef = useRef(generate);
@@ -705,7 +726,7 @@ export default function App() {
         listeningRef.current &&
         !requestRef.current &&
         session.transcript.length > (notesWatermarkRef.current[session.id] || 0)
-      ) void generateRef.current("Create meeting notes.", "summary");
+      ) void generateRef.current(notesPrompt(session), "summary");
     }, 60000);
     return () => clearInterval(timer);
   }, [loaded]);
@@ -794,6 +815,7 @@ export default function App() {
         companion.mode === "main" &&
         companion.visible !== false &&
         answerTab === "answer" &&
+        selected?.mode !== "Video" && selected?.assistanceMode !== "subtitles" &&
         modal === null
       ) {
         e.preventDefault();
@@ -847,7 +869,8 @@ export default function App() {
     setView(next);
     setQuestion("");
     setAnswerIndex(null);
-    setAnswerTab("answer");
+    const nextSession = stateRef.current.sessions.find((session) => session.id === id);
+    setAnswerTab(nextSession?.mode === "Video" ? "summary" : "answer");
   }
   async function openSession(session: InterviewSession) {
     if (session.status === "ready")
@@ -857,37 +880,56 @@ export default function App() {
   async function toggleAudio() {
     if (audioOperationRef.current) return;
     if (listeningRef.current) {
+      const sessionId = selectedRef.current;
       await stopAudio();
+      if (sessionId) await finalizeVideoNotes(sessionId);
       return;
     }
     if (!selected) return;
     await startAudio(selected.id);
   }
-  async function startAudio(sessionId: string) {
-    if (audioOperationRef.current || listeningRef.current) return;
+  async function startAudio(sessionId: string): Promise<boolean> {
+    if (audioOperationRef.current) return false;
+    if (listeningRef.current) return acceptingTranscriptRef.current === sessionId;
     if (!runtime.transcription) {
       notify("Set up local transcription in Settings first.");
       setBackgroundError("Set up local transcription in Settings before starting background listening.");
       await showWorkspace(true);
-      return;
+      return false;
+    }
+    const session = stateRef.current.sessions.find((item) => item.id === sessionId);
+    const video = session?.mode === "Video";
+    const macVideo = video && runtime.platform === "macos";
+    const device = macVideo ? "system" : video ? videoInputs[sessionId] || "" : stateRef.current.settings.inputDevice;
+    if (video && !macVideo && (!device || device === "system")) {
+      notify("Route browser audio to a loopback or virtual input, then choose it in Audio input device.");
+      return false;
     }
     audioOperationRef.current = true;
     setAudioBusy(true);
+    const startedAt = Date.now();
     try {
       acceptingTranscriptRef.current = sessionId;
       await api.startListening({
-        device: stateRef.current.settings.inputDevice,
+        device,
         language: stateRef.current.settings.language,
         sessionId,
-        source: stateRef.current.settings.audioSource,
+        source: macVideo ? "system" : video ? "microphone" : stateRef.current.settings.audioSource,
       });
       listeningRef.current = true;
       setListening(true);
-      updateSession(sessionId, (s) => s.status === "ready" ? { ...s, status: "active" } : s);
+      updateSession(sessionId, (s) => ({
+        ...s, status: s.status === "ready" ? "active" : s.status,
+        ...(s.mode === "Video" && s.mediaStartedAt === undefined ? { mediaStartedAt: startedAt } : {}),
+      }));
+      return true;
     } catch (e) {
       acceptingTranscriptRef.current = null;
+      listeningRef.current = false;
+      setListening(false);
       setBackgroundError(errorText(e));
       notify(errorText(e));
+      return false;
     } finally {
       audioOperationRef.current = false;
       setAudioBusy(false);
@@ -895,6 +937,7 @@ export default function App() {
   }
 
   async function showWorkspace(settings = false) {
+    companionVisibilityRevisionRef.current += 1;
     if (api.setCompanionMode) setCompanion(await api.setCompanionMode("main"));
     if (api.setCompanionVisible) setCompanion(await api.setCompanionVisible(true));
     setModal(null);
@@ -903,7 +946,7 @@ export default function App() {
   async function startBackgroundAssistance(mode: AssistanceMode) {
     if (!loadedRef.current) return;
     let session = stateRef.current.sessions.find((s) => s.id === selectedRef.current && s.status !== "ended");
-    if (mode === "notes" && !listeningRef.current && session?.mode !== "Meeting")
+    if (mode === "notes" && !listeningRef.current && session?.mode !== "Meeting" && session?.mode !== "Video")
       session = undefined;
     if (!session) {
       session = {
@@ -918,6 +961,8 @@ export default function App() {
       selectedRef.current = session.id;
       setSelectedId(session.id);
     } else {
+      // Tray answer/listen actions must not enable automatic replies to video speech.
+      if (session.mode === "Video" && mode !== "notes") mode = "subtitles";
       const next = {
         ...stateRef.current,
         sessions: stateRef.current.sessions.map((s) => s.id === session!.id ? { ...s, assistanceMode: mode } : s),
@@ -935,7 +980,7 @@ export default function App() {
     else setAnswerTab("answer");
     await startAudio(session.id);
     if (mode === "notes" && session.transcript.length && !requestRef.current)
-      void generateRef.current("Create meeting notes.", "summary");
+      void generateRef.current(notesPrompt(session), "summary");
   }
   async function applyMeetingTrigger(hint?: MeetingHint) {
     const action = stateRef.current.settings.meetingAction || "none";
@@ -958,9 +1003,10 @@ export default function App() {
       // turn as stopListening's reply. Let that update settle before the recap.
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       const session = stateRef.current.sessions.find((s) => s.id === selectedRef.current);
-      if (session?.assistanceMode === "notes" && !requestRef.current &&
+      if (session?.mode === "Video") await finalizeVideoNotes(session.id);
+      else if (session?.assistanceMode === "notes" && !requestRef.current &&
         session.transcript.length > (notesWatermarkRef.current[session.id] || 0))
-        void generateRef.current("Create meeting notes.", "summary");
+        void generateRef.current(notesPrompt(session), "summary");
     }
     else if (event.action === "meeting-trigger") await applyMeetingTrigger();
     else await startBackgroundAssistance(event.action === "notes" ? "notes" : event.action === "answers" ? "answers" : "manual");
@@ -1024,8 +1070,9 @@ export default function App() {
   async function endSession() {
     if (!selected) return;
     await stopAudio();
-    await cancel();
+    if (selected.mode !== "Video") await cancel();
     updateSession(selected.id, (s) => ({ ...s, status: "ended" }));
+    await finalizeVideoNotes(selected.id);
   }
   async function setupVoice() {
     setVoiceSetup(true);
@@ -1050,9 +1097,15 @@ export default function App() {
   }
   function createSession(e: FormEvent) {
     e.preventDefault();
+    const { mediaOffsetSeconds: offsetDraft, ...fields } = draft;
+    const mediaOffsetSeconds = Number(offsetDraft);
+    if (draft.mode === "Video" && (!Number.isFinite(mediaOffsetSeconds) || mediaOffsetSeconds < 0 || mediaOffsetSeconds > 359999)) {
+      notify("Enter a video starting position between 0 and 359999 seconds.");
+      return;
+    }
     const session: InterviewSession = {
       id: uid(),
-      ...draft,
+      ...fields,
       title:
         draft.title.trim() ||
         `${draft.company.trim() || "New"} ${draft.mode.toLowerCase()}`,
@@ -1063,6 +1116,7 @@ export default function App() {
       duration: 0,
       transcript: [],
       answers: [],
+      ...(draft.mode === "Video" ? { assistanceMode: "notes", mediaOffsetSeconds } : {}),
     };
     const inputError = sessionInputError(session);
     if (inputError) {
@@ -1081,6 +1135,7 @@ export default function App() {
       mode,
       context: "",
       instructions: "",
+      mediaOffsetSeconds: "0",
     });
     setModal("create");
   }
@@ -1113,6 +1168,12 @@ export default function App() {
         ? claude.connected && claude.subscription
         : localReady;
   const latestQuestion = selected?.transcript.at(-1)?.text || "";
+  const videoSubtitles = selected?.mode === "Video" && selected.assistanceMode === "subtitles";
+  const videoTranscript = selected?.transcript.filter((entry) => entry.source !== "typed") || [];
+  const latestCaption = videoTranscript.at(-1);
+  const canExportSubtitles = !!selected?.mediaStartedAt && videoTranscript.some((entry) =>
+    entry.startMs !== undefined && entry.endMs !== undefined && entry.endMs > entry.startMs,
+  );
   const displayShortcut = (value: string) =>
     value
       .replace(
@@ -1159,6 +1220,7 @@ export default function App() {
       notify("Pin mode is available in the updated desktop app.");
       return false;
     }
+    companionVisibilityRevisionRef.current += 1;
     companionBusyRef.current = true;
     setCompanionBusy(true);
     try {
@@ -1188,6 +1250,10 @@ export default function App() {
     const session = stateRef.current.sessions.find(
       (s) => s.id === selectedRef.current,
     );
+    if (session?.mode === "Video" || session?.assistanceMode === "subtitles") {
+      if (session.mode === "Video") setAnswerTab("summary");
+      return;
+    }
     const latest = session?.transcript.at(-1);
     const previousAnswer = session?.answers.at(-1);
     if (
@@ -1227,6 +1293,7 @@ export default function App() {
     if (!loaded) return;
     const configuration: CompanionConfiguration = {
       captureProtection: stateRef.current.settings.captureProtection !== false,
+      clickThrough: stateRef.current.settings.clickThrough === true,
       answerShortcut:
         stateRef.current.settings.answerShortcut ||
         defaults.settings.answerShortcut!,
@@ -1253,6 +1320,7 @@ export default function App() {
               setCompanion(accepted);
               updateSettings({
                 captureProtection: accepted.captureProtectionEnabled ?? true,
+                clickThrough: accepted.clickThrough ?? stateRef.current.settings.clickThrough ?? false,
                 answerShortcut:
                   accepted.answerShortcut || defaults.settings.answerShortcut!,
                 visibilityShortcut:
@@ -1266,19 +1334,33 @@ export default function App() {
           }
         });
   }, [loaded]);
-  useEffect(
-    () =>
-      api.onCompanionVisibility?.((visible) =>
-        setCompanion((previous) => ({ ...previous, visible })),
-      ),
-    [],
-  );
+  useEffect(() => {
+    const unsubscribe = api.onCompanionVisibility?.((visible) => {
+      const revision = ++companionVisibilityRevisionRef.current;
+      setCompanion((previous) => ({ ...previous, visible }));
+      if (!visible || !api.getCompanionStatus) return;
+      // Recovery may restore a click-through Pin/Answer window to Main so
+      // pointer controls work again. Read that native mode before rendering it.
+      void api.getCompanionStatus().then((status) => {
+        if (companionVisibilityRevisionRef.current !== revision) return;
+        setCompanion((previous) => ({ ...previous, ...status, visible: true }));
+      }).catch((error) => {
+        if (companionVisibilityRevisionRef.current === revision) notify(errorText(error));
+      });
+    });
+    return () => {
+      companionVisibilityRevisionRef.current += 1;
+      unsubscribe?.();
+    };
+  }, []);
   async function saveCompanionSettings(patch: Partial<CompanionConfiguration>) {
     if (!api.configureCompanion || shortcutSaving) return;
+    companionVisibilityRevisionRef.current += 1;
     setShortcutSaving(true);
     setShortcutError("");
     const configuration: CompanionConfiguration = {
       captureProtection: state.settings.captureProtection !== false,
+      clickThrough: state.settings.clickThrough === true,
       answerShortcut:
         state.settings.answerShortcut || defaults.settings.answerShortcut!,
       visibilityShortcut:
@@ -1292,6 +1374,7 @@ export default function App() {
       setCompanion(result);
       const saved = {
         captureProtection: configuration.captureProtection,
+        clickThrough: result.clickThrough ?? configuration.clickThrough ?? false,
         answerShortcut:
           result.answerShortcut ||
           configuration.answerShortcut ||
@@ -1325,11 +1408,44 @@ export default function App() {
       notify("Hide / show is available in the updated desktop app.");
       return;
     }
+    companionVisibilityRevisionRef.current += 1;
     try {
       const result = await api.setCompanionVisible(false);
       setCompanion(result);
     } catch (e) {
       notify(errorText(e));
+    }
+  }
+  async function takeNotesInBackground() {
+    if (backgroundNotesBusyRef.current || !selected || selected.status === "ended") return;
+    if (!api.setCompanionVisible) {
+      notify("Background notes are available in the updated desktop app.");
+      return;
+    }
+    if (!aiReady) {
+      notify("Connect your selected AI in Settings before taking notes in background.");
+      await showWorkspace(true);
+      return;
+    }
+    backgroundNotesBusyRef.current = true;
+    setBackgroundNotesBusy(true);
+    try {
+      pendingAutoQuestion.current = null;
+      clearTimeout(autoTimer.current);
+      await cancel();
+      const next = {
+        ...stateRef.current,
+        sessions: stateRef.current.sessions.map((session) => session.id === selected.id ? { ...session, assistanceMode: "notes" as const } : session),
+      };
+      stateRef.current = next;
+      setState(next);
+      setAnswerTab("summary");
+      const started = listeningRef.current || await startAudio(selected.id);
+      if (!started || !listeningRef.current) return;
+      await hideAssistant();
+    } finally {
+      backgroundNotesBusyRef.current = false;
+      setBackgroundNotesBusy(false);
     }
   }
   const editContext = () => {
@@ -1351,10 +1467,63 @@ export default function App() {
         .then(() => notify("Answer copied."))
         .catch((e) => notify(errorText(e)));
   };
+  async function setVideoAssistance(mode: "notes" | "subtitles") {
+    if (!selected) return;
+    pendingAutoQuestion.current = null;
+    clearTimeout(autoTimer.current);
+    updateSession(selected.id, (session) => ({ ...session, assistanceMode: mode }));
+    setAnswerTab("summary");
+    if (mode === "subtitles") await cancel();
+  }
+  async function finalizeVideoNotes(sessionId: string) {
+    // A stopped recorder drains its final segment before replying. Allow the
+    // transcript render to settle, then wait out any notes using an older snapshot.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    while (requestRef.current && selectedRef.current === sessionId) {
+      const completion = requestCompletionRef.current;
+      if (!completion || completion.id !== requestRef.current.id) return;
+      await completion.promise;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    const session = stateRef.current.sessions.find((item) => item.id === sessionId);
+    if (selectedRef.current !== sessionId || session?.mode !== "Video" || session.assistanceMode !== "notes") return;
+    if (session.transcript.length > (notesWatermarkRef.current[sessionId] || 0)) {
+      await generateRef.current(notesPrompt(session), "summary");
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  async function exportMarkdown() {
+    if (!selected) return;
+    const sessionId = selected.id;
+    if (listeningRef.current) await stopAudio();
+    if (selected.mode === "Video") await finalizeVideoNotes(sessionId);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const session = stateRef.current.sessions.find((item) => item.id === sessionId);
+    if (!session) return;
+    try {
+      if (await api.exportSession(session)) notify("Session exported.");
+    } catch (error) { notify(errorText(error)); }
+  }
+  async function exportSubtitles(format: "srt" | "vtt") {
+    if (!selected || !api.exportSubtitles) return;
+    if (listeningRef.current) {
+      await stopAudio();
+      // Native stop flushes the final speech chunk. Let its React update settle.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    await finalizeVideoNotes(selected.id);
+    const session = stateRef.current.sessions.find((item) => item.id === selected.id);
+    if (!session) return;
+    try {
+      if (await api.exportSubtitles(session, format)) notify(`${format.toUpperCase()} subtitles exported.`);
+    } catch (error) { notify(errorText(error)); }
+  }
   const sessionRow = (s: InterviewSession) => (
     <div className="session-row" key={s.id}>
       <div className={"session-icon mode-" + s.mode.toLowerCase()}>
-        {s.mode === "Meeting" ? (
+        {s.mode === "Video" ? (
+          <Video size={19} />
+        ) : s.mode === "Meeting" ? (
           <MessageCircle size={19} />
         ) : s.mode === "Practice" ? (
           <Mic size={19} />
@@ -1427,7 +1596,7 @@ export default function App() {
   ) : answerTab === "summary" && selected?.summary ? (
     <>
       <div className="answer-label">
-        {selected?.mode === "Meeting" ? "MEETING NOTES" : "SESSION RECAP"}
+        {selected?.mode === "Video" ? "VIDEO NOTES" : selected?.mode === "Meeting" ? "MEETING NOTES" : "SESSION RECAP"}
       </div>
       <div className="markdown">
         <Markdown>{selected.summary}</Markdown>
@@ -1454,7 +1623,7 @@ export default function App() {
       </h2>
       <p>
         {answerTab === "summary"
-          ? "Turn your conversation into key points and next steps."
+          ? selected?.mode === "Video" ? "Capture the video audio, then turn it into key points and useful details." : "Turn your conversation into key points and next steps."
           : "Listen to a question or type one below. Your assistant will help you shape an answer."}
       </p>
       {answerTab === "answer" && selected?.status !== "ended" && (
@@ -1477,10 +1646,10 @@ export default function App() {
         <button
           className="button primary"
           disabled={!selected?.transcript.length || generating}
-          onClick={() => void generate("Summarize this session.", "summary")}
+          onClick={() => void generate(selected?.mode === "Video" ? notesPrompt(selected) : "Summarize this session.", "summary")}
         >
           <Sparkles size={16} />
-          {selected?.mode === "Meeting"
+          {selected?.mode === "Video" ? "Create video notes" : selected?.mode === "Meeting"
             ? "Create meeting notes"
             : "Generate recap"}
         </button>
@@ -1488,8 +1657,8 @@ export default function App() {
     </div>
   );
   const answerRegionLabel =
-    answerTab === "summary"
-      ? selected?.mode === "Meeting"
+    videoSubtitles ? "Latest caption" : answerTab === "summary"
+      ? selected?.mode === "Video" ? "Video notes" : selected?.mode === "Meeting"
         ? "Meeting notes"
         : "Session recap"
       : "Suggested answer";
@@ -1525,8 +1694,8 @@ export default function App() {
                 "companion-pin " +
                 (generating ? "thinking" : listening ? "is-listening" : "")
               }
-              aria-label="Show answer"
-              title={"Show answer · " + (listening ? "Listening" : "Paused")}
+              aria-label={selected.mode === "Video" ? "Show video assistant" : "Show answer"}
+              title={(selected.mode === "Video" ? "Show video assistant · " : "Show answer · ") + (listening ? "Listening" : "Paused")}
               disabled={companionBusy}
               onClick={() => void showCompanionAnswer()}
             >
@@ -1605,23 +1774,29 @@ export default function App() {
               role="region"
               aria-label={answerRegionLabel}
             >
-              {generating ||
+              {videoSubtitles ? (
+                <div className="floating-caption" aria-live="polite">
+                  <div className="answer-label"><Captions size={14} />LATEST CAPTION</div>
+                  <p>{latestCaption?.text || "Start listening to capture spoken captions from the video."}</p>
+                </div>
+              ) : generating ||
               latestAnswer ||
               (answerTab === "summary" && selected.summary) ? (
                 answerBody
               ) : (
                 <div className="companion-empty">
                   <Sparkles size={26} />
-                  <h3>Ready when you are.</h3>
+                  <h3>{selected.mode === "Video" ? "Capture the useful parts." : "Ready when you are."}</h3>
                   <p>
-                    {latestQuestion ||
-                      "Start listening in the full app, then click the pin when you need an answer."}
+                    {latestQuestion || (selected.mode === "Video"
+                      ? "Start listening to capture video speech, then create notes."
+                      : "Start listening in the full app, then click the pin when you need an answer.")}
                   </p>
                 </div>
               )}
             </div>
             <div className="companion-actions">
-              {generating ? (
+              {videoSubtitles ? null : generating ? (
                 <button
                   className="button secondary"
                   onClick={() => void cancel()}
@@ -1632,19 +1807,19 @@ export default function App() {
               ) : (
                 <button
                   className="button primary"
-                  disabled={!latestQuestion || selected.status === "ended"}
-                  onClick={() => void generate(latestQuestion)}
+                  disabled={!latestQuestion || (selected.mode !== "Video" && selected.status === "ended")}
+                  onClick={() => void generate(selected.mode === "Video" ? notesPrompt(selected) : latestQuestion, selected.mode === "Video" ? "summary" : "answer")}
                 >
                   <Sparkles size={14} />
-                  Get answer
+                  {selected.mode === "Video" ? "Create video notes" : "Get answer"}
                 </button>
               )}
               <button
                 className="icon-button"
-                aria-label="Copy answer"
-                title="Copy answer"
-                disabled={!answerText}
-                onClick={copyAnswer}
+                aria-label={videoSubtitles ? "Copy caption" : "Copy answer"}
+                title={videoSubtitles ? "Copy caption" : "Copy answer"}
+                disabled={videoSubtitles ? !latestCaption : !answerText}
+                onClick={videoSubtitles ? () => void (api.copyText ? api.copyText(latestCaption?.text || "") : navigator.clipboard.writeText(latestCaption?.text || "")).catch((error) => notify(errorText(error))) : copyAnswer}
               >
                 <Copy size={16} />
               </button>
@@ -1658,6 +1833,7 @@ export default function App() {
                 {listening ? <Pause size={16} /> : <Mic size={16} />}
               </button>
             </div>
+            {(selected.mode === "Meeting" || selected.mode === "Video") && selected.status !== "ended" && <button className="button secondary floating-background-notes" disabled={backgroundNotesBusy || audioBusy} onClick={() => void takeNotesInBackground()}><EyeOff size={14} />{backgroundNotesBusy ? "Starting background notes…" : "Take notes in background"}</button>}
             <footer className="companion-footer">
               <span title="Verify your recording or share preview. Capture exclusion varies by operating system and recording app.">
                 <ShieldCheck size={11} />
@@ -2540,6 +2716,14 @@ export default function App() {
                     <span />
                   </button>
                 </div>
+                <div className="preference-row">
+                  <div>
+                    <strong>Allow clicks through floating assistant</strong>
+                    <p>Pin and answer windows let you click the app underneath. Use {shortcut}, {visibilityShortcut}, or the system tray to recover the controls. The full app stays interactive.</p>
+                  </div>
+                  <button className={"toggle " + (state.settings.clickThrough ? "on" : "")} role="switch" aria-label="Allow clicks through floating assistant" aria-checked={state.settings.clickThrough === true} disabled={shortcutSaving || !api.configureCompanion || (companion.visibilityShortcutAvailable === false && !background.trayAvailable)} onClick={() => void saveCompanionSettings({ clickThrough: state.settings.clickThrough !== true })}><span /></button>
+                </div>
+                <p className="shortcut-status">For screen sharing, hide the assistant or choose Take notes in background in a meeting or video session. {runtime.platform === "macos" ? "A visible floating assistant can appear in a full-screen Zoom share on Mac." : "Check your sharing preview when using a visible floating assistant."} Clicks passing through affect interaction, not screen capture.</p>
                 <form
                   onSubmit={(event) => {
                     event.preventDefault();
@@ -2668,14 +2852,16 @@ export default function App() {
               </div>
               <div className="live-heading-actions">
                 <button
-                  className="icon-button"
+                  className="button secondary"
                   aria-label="Hide assistant"
-                  title={"Hide assistant · " + visibilityShortcut}
+                  title={"Hide for screen sharing · " + visibilityShortcut}
                   disabled={companion.visibilityShortcutAvailable === false && !background.trayAvailable}
                   onClick={() => void hideAssistant()}
                 >
                   <EyeOff size={17} />
+                  Hide for screen sharing
                 </button>
+                {(selected.mode === "Meeting" || selected.mode === "Video") && selected.status !== "ended" && <button className="button primary" disabled={backgroundNotesBusy || audioBusy || !api.setCompanionVisible || (companion.visibilityShortcutAvailable === false && !background.trayAvailable)} onClick={() => void takeNotesInBackground()}>{backgroundNotesBusy ? <Loader2 size={15} className="spin" /> : <FileText size={15} />}{backgroundNotesBusy ? "Starting background notes…" : "Take notes in background"}</button>}
                 <button
                   className="button secondary"
                   disabled={companionBusy}
@@ -2691,14 +2877,8 @@ export default function App() {
                   </summary>
                   <div>
                     <button
-                      onClick={() =>
-                        api
-                          .exportSession(selected)
-                          .then((saved) => {
-                            if (saved) notify("Session exported.");
-                          })
-                          .catch((e) => notify(errorText(e)))
-                      }
+                      disabled={audioBusy}
+                      onClick={() => void exportMarkdown()}
                     >
                       <ArrowDownToLine size={15} />
                       Export Markdown
@@ -2721,6 +2901,7 @@ export default function App() {
                 )}
               </div>
             </div>
+            {(selected.mode === "Meeting" || selected.mode === "Video") && <p className="background-notes-guide">Background notes hide NextCue while listening continues. Bring it back with <strong>{visibilityShortcut}</strong> or the system tray. {runtime.platform === "macos" && "Hide the floating assistant before sharing your full screen on Mac."}</p>}
             <div className="audio-toolbar">
               <div className={"listening-badge " + (listening ? "on" : "")}>
                 <span className={"dot " + (listening ? "green" : "gray")} />
@@ -2730,28 +2911,31 @@ export default function App() {
                     ? "Session ended"
                     : "Listening paused"}
               </div>
-              <label className="compact-select">
+              {selected.mode === "Video" && runtime.platform === "macos" ? (
+                <span className="video-audio-source"><Monitor size={14} />Mac system audio</span>
+              ) : <label className="compact-select">
                 <Mic size={14} />
                 <select
                   aria-label="Audio input device"
-                  value={state.settings.inputDevice}
+                  value={selected.mode === "Video" ? videoInputs[selected.id] || "" : state.settings.inputDevice}
                   disabled={listening || audioBusy}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    if (selected.mode === "Video") setVideoInputs((inputs) => ({ ...inputs, [selected.id]: e.target.value }));
                     updateSettings({
                       inputDevice: e.target.value,
                       audioSource:
                         e.target.value === "system" ? "system" : "microphone",
-                    })
-                  }
+                    });
+                  }}
                 >
-                  <option value="">Default microphone</option>
-                  {devices.map((d) => (
+                  <option value="">{selected.mode === "Video" ? "Choose loopback input" : "Default microphone"}</option>
+                  {devices.filter((device) => selected.mode !== "Video" || device.id !== "system").map((d) => (
                     <option key={d.id} value={d.id}>
                       {d.name}
                     </option>
                   ))}
                 </select>
-              </label>
+              </label>}
               {selected.status !== "ended" && audioButton}
               <span className="session-clock">
                 <Clock3 size={14} />
@@ -2759,7 +2943,12 @@ export default function App() {
               </span>
             </div>
             <div className="session-toolbar">
-              <div className="auto-answer">
+              {selected.mode === "Video" ? (
+                <div className="video-mode-picker" role="group" aria-label="Video assistance">
+                  <button className={videoSubtitles ? "" : "selected"} aria-pressed={!videoSubtitles} onClick={() => void setVideoAssistance("notes")}><FileText size={15} />Notes</button>
+                  <button className={videoSubtitles ? "selected" : ""} aria-pressed={videoSubtitles} onClick={() => void setVideoAssistance("subtitles")}><Captions size={15} />Subtitles</button>
+                </div>
+              ) : <div className="auto-answer">
                 <Zap size={14} />
                 <span>Auto suggestions</span>
                 <button
@@ -2778,7 +2967,7 @@ export default function App() {
                 >
                   <span />
                 </button>
-              </div>
+              </div>}
               <div className="session-details">
                 <button
                   className={
@@ -2816,7 +3005,42 @@ export default function App() {
             <div
               className={"live-layout " + (detailsTab ? "details-open" : "")}
             >
-              <section className="panel answer-panel live-answer-main">
+              {selected.mode === "Video" ? (
+                <div className="video-workspace">
+                  <section className="panel video-guide">
+                    <div><Video size={19} /><strong>Capture notes and subtitles from browser videos</strong></div>
+                    <p>{runtime.platform === "macos"
+                      ? "Open YouTube or another video in your browser, choose Start listening, and play it. NextCue captures Mac system audio, including through headphones. Allow Screen & System Audio Recording if macOS asks."
+                      : "Route your computer’s playback audio to a loopback or virtual input, choose that input above for this session, then Start listening and play YouTube or another browser video. Make sure the chosen input carries playback audio rather than a physical microphone."} No browser extension is needed.</p>
+                    <p className="helper-line">Subtitle timing follows elapsed time from your first listening start, plus your video starting position ({selected.mediaOffsetSeconds || 0}s). Keep playback running continuously. After pausing, seeking, or replaying the video, start a new session with its current position to keep subtitles aligned.</p>
+                  </section>
+                  {!videoSubtitles && (
+                    <section className="panel answer-panel video-notes-panel">
+                      <div className="video-panel-heading"><h2><FileText size={17} />Video notes</h2><span className="ai-local">{providerLabel}</span></div>
+                      <p className="context-insight" role="status">Notes update about once a minute as new speech arrives. {aiReady ? `Your selected ${providerLabel} creates the notes.` : "Connect your selected AI in Settings to generate notes. You can capture subtitles without an AI provider."}</p>
+                      <div className="answer-content" tabIndex={0} role="region" aria-label="Video notes">{answerBody}</div>
+                      {selected.summary && <div className="answer-footer"><button className="button secondary" disabled={generating || audioBusy} onClick={() => void generate(notesPrompt(selected), "summary")}><RefreshCw size={15} />Update video notes</button><button className="text-button" onClick={copyAnswer}><Copy size={14} />Copy notes</button></div>}
+                    </section>
+                  )}
+                  <section className="panel video-captions-panel">
+                    <div className="video-panel-heading"><h2><Captions size={17} />Live captions</h2><span className="ai-local">LOCAL TRANSCRIPTION</span></div>
+                    {videoSubtitles && <p className="context-insight" role="status">Subtitles mode captures speech without generating AI notes or automatic answers. Captions appear after each speech segment is transcribed.</p>}
+                    <div className="latest-caption" role="region" aria-label="Latest caption" aria-live="polite">
+                      <span>Latest caption</span>
+                      <p>{latestCaption?.text || "Start listening and play the video to capture spoken captions."}</p>
+                    </div>
+                    <div className="video-export-actions">
+                      <button className="button secondary" disabled={!api.exportSubtitles || !canExportSubtitles || audioBusy} onClick={() => void exportSubtitles("srt")}><ArrowDownToLine size={15} />Export SRT</button>
+                      <button className="button secondary" disabled={!api.exportSubtitles || !canExportSubtitles || audioBusy} onClick={() => void exportSubtitles("vtt")}><ArrowDownToLine size={15} />Export VTT</button>
+                      <p>Exports pause listening and save timed speech captions. Review transcription accuracy before sharing.</p>
+                    </div>
+                    <div className="video-transcript-heading"><h3>Video transcript</h3><span>{videoTranscript.length} segments</span></div>
+                    <div className="video-transcript" role="region" aria-label="Video transcript" tabIndex={0}>
+                      {videoTranscript.length ? videoTranscript.map((entry) => <div className="video-transcript-entry" key={entry.id}><time>{entry.startMs !== undefined && selected.mediaStartedAt ? mediaTime(selected, entry.startMs) : time(entry.time)}</time><p>{entry.text}</p></div>) : <p className="video-transcript-empty">Spoken video audio will appear here as it is transcribed.</p>}
+                    </div>
+                  </section>
+                </div>
+              ) : <section className="panel answer-panel live-answer-main">
                 {selected.assistanceMode === "notes" && (
                   <p className="context-insight" role="status">
                     Note taking is on. Notes update about once a minute as new transcript arrives; automatic answers are off.
@@ -3008,7 +3232,7 @@ export default function App() {
                     )
                   )}
                 </div>
-              </section>
+              </section>}
               {detailsTab && (
                 <aside className="panel details-drawer">
                   <div className="column-heading">
@@ -3035,13 +3259,13 @@ export default function App() {
                                 {entry.source === "typed"
                                   ? "Your question"
                                   : entry.source === "system"
-                                    ? "Call audio"
+                                    ? selected.mode === "Video" ? "Video audio" : "Call audio"
                                     : "Microphone"}
                               </span>
                               <time>{time(entry.time)}</time>
                             </div>
                             <p>{entry.text}</p>
-                            <button
+                            {selected.mode !== "Video" && <button
                               className="transcript-answer"
                               disabled={
                                 generating || selected.status === "ended"
@@ -3050,7 +3274,7 @@ export default function App() {
                             >
                               <Sparkles size={12} />
                               Suggest answer
-                            </button>
+                            </button>}
                           </div>
                         ))
                       ) : (
@@ -3219,6 +3443,14 @@ export default function App() {
             )}
             <div className="quick-starts">
               <button
+                className="quick-start quick-start-video"
+                onClick={() => newSession("Video")}
+              >
+                <div className="session-icon mode-video"><Video size={21} /></div>
+                <span><strong>Video notes and subtitles</strong><small>Capture YouTube and browser video audio</small></span>
+                <ArrowRight size={16} />
+              </button>
+              <button
                 className="quick-start"
                 onClick={() => newSession("Practice")}
               >
@@ -3292,13 +3524,13 @@ export default function App() {
       {modal === "create" && (
         <Modal
           title="Start a conversation"
-          subtitle="Choose what you need. You can personalize the answers anytime."
+          subtitle="Choose what you need. Add context to personalize the results anytime."
           onClose={() => setModal(null)}
           wide
         >
           <form onSubmit={createSession}>
             <div className="mode-picker">
-              {(["Interview", "Practice", "Meeting"] as SessionMode[]).map(
+              {(["Interview", "Practice", "Meeting", "Video"] as SessionMode[]).map(
                 (mode) => (
                   <button
                     type="button"
@@ -3307,7 +3539,9 @@ export default function App() {
                     aria-pressed={draft.mode === mode}
                     onClick={() => setDraft((d) => ({ ...d, mode }))}
                   >
-                    {mode === "Meeting" ? (
+                    {mode === "Video" ? (
+                      <Video size={16} />
+                    ) : mode === "Meeting" ? (
                       <MessageCircle size={16} />
                     ) : mode === "Practice" ? (
                       <Mic size={16} />
@@ -3327,13 +3561,13 @@ export default function App() {
                 onChange={(e) =>
                   setDraft((d) => ({ ...d, title: e.target.value }))
                 }
-                placeholder="e.g. Software engineer interview"
+                placeholder={draft.mode === "Video" ? "e.g. Notes from a YouTube tutorial" : "e.g. Software engineer interview"}
                 maxLength={150}
                 required
               />
             </label>
             <label>
-              {draft.mode === "Meeting" ? "Role or objective" : "Role"}
+              {draft.mode === "Video" ? "Learning objective" : draft.mode === "Meeting" ? "Role or objective" : "Role"}
               <span className="optional">Optional</span>
               <input
                 value={draft.role}
@@ -3341,17 +3575,25 @@ export default function App() {
                   setDraft((d) => ({ ...d, role: e.target.value }))
                 }
                 placeholder={
-                  draft.mode === "Meeting"
+                  draft.mode === "Video" ? "e.g. Learn the main concepts" : draft.mode === "Meeting"
                     ? "e.g. Plan the next release"
                     : "e.g. Software Engineer"
                 }
                 maxLength={150}
               />
             </label>
+            {draft.mode === "Video" && <>
+              <label>
+                Video starting position (seconds)
+                <span className="optional">Optional</span>
+                <input type="number" min="0" max="359999" step="any" value={draft.mediaOffsetSeconds} onChange={(event) => setDraft((value) => ({ ...value, mediaOffsetSeconds: event.target.value }))} />
+              </label>
+              <p className="helper-line video-create-guide">Enter the video’s current playhead when you start listening (for example, 90 for 1:30). Play YouTube or another browser video while NextCue listens to {runtime.platform === "macos" ? "Mac system audio" : "a selected loopback or virtual audio input"}. No browser extension is needed. Keep playback continuous; create a new session after pausing or seeking to keep subtitles aligned.</p>
+            </>}
             <details className="form-disclosure">
               <summary>
                 <Sparkles size={15} />
-                Personalize answers<span>Optional</span>
+                {draft.mode === "Video" ? "Personalize notes" : "Personalize answers"}<span>Optional</span>
                 <ChevronDown size={15} />
               </summary>
               <label>
@@ -3366,7 +3608,7 @@ export default function App() {
                 />
               </label>
               <label htmlFor="background-context">
-                {draft.mode === "Meeting"
+                {draft.mode === "Video" ? "Video background" : draft.mode === "Meeting"
                   ? "Meeting background"
                   : "Your background"}
                 <button
@@ -3384,7 +3626,7 @@ export default function App() {
                     setDraft((d) => ({ ...d, context: e.target.value }))
                   }
                   placeholder={
-                    draft.mode === "Meeting"
+                    draft.mode === "Video" ? "Video topic, terminology, or concepts to focus on…" : draft.mode === "Meeting"
                       ? "Agenda, project facts, decisions to make…"
                       : "Your experience, resume, or the job description…"
                   }
@@ -3393,13 +3635,13 @@ export default function App() {
                 />
               </label>
               <label>
-                Answer guidance
+                {draft.mode === "Video" ? "Notes guidance" : "Answer guidance"}
                 <input
                   value={draft.instructions}
                   onChange={(e) =>
                     setDraft((d) => ({ ...d, instructions: e.target.value }))
                   }
-                  placeholder="e.g. Keep answers concise and use examples"
+                  placeholder={draft.mode === "Video" ? "e.g. Summarize concepts and include important examples" : "e.g. Keep answers concise and use examples"}
                   maxLength={3000}
                 />
               </label>
@@ -3419,13 +3661,13 @@ export default function App() {
       )}
       {modal === "context" && selected && (
         <Modal
-          title="Personalize your answers"
-          subtitle="Give your assistant the experience and examples you want it to draw from."
+          title={selected.mode === "Video" ? "Personalize your notes" : "Personalize your answers"}
+          subtitle={selected.mode === "Video" ? "Add the topic and details you want the notes to focus on." : "Give your assistant the experience and examples you want it to draw from."}
           onClose={() => setModal(null)}
           wide
         >
           <label htmlFor="background-context">
-            Your background
+            {selected.mode === "Video" ? "Video background" : "Your background"}
             <button
               className="text-button label-action"
               onClick={() => void importContext()}
@@ -3444,7 +3686,7 @@ export default function App() {
             />
           </label>
           <label>
-            Answer guidance
+            {selected.mode === "Video" ? "Notes guidance" : "Answer guidance"}
             <textarea
               rows={2}
               value={draft.instructions}

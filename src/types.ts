@@ -1,7 +1,7 @@
-export type SessionMode = "Interview" | "Practice" | "Meeting";
+export type SessionMode = "Interview" | "Practice" | "Meeting" | "Video";
 export type SessionStatus = "ready" | "active" | "ended";
 export type AnswerProvider = "local" | "chatgpt" | "claude";
-export type AssistanceMode = "manual" | "notes" | "answers";
+export type AssistanceMode = "manual" | "notes" | "answers" | "subtitles";
 export type MeetingAction = "none" | "prompt" | "listen-notes" | "listen-answer";
 export interface BackgroundConfiguration {
   runInBackground: boolean;
@@ -34,6 +34,8 @@ export interface TranscriptEntry {
   text: string;
   time: number;
   source: "microphone" | "system" | "typed";
+  startMs?: number;
+  endMs?: number;
 }
 export interface Answer {
   id: string;
@@ -58,6 +60,8 @@ export interface InterviewSession {
   answers: Answer[];
   summary?: string;
   assistanceMode?: AssistanceMode;
+  mediaStartedAt?: number;
+  mediaOffsetSeconds?: number;
 }
 export interface Settings {
   model: string;
@@ -67,6 +71,7 @@ export interface Settings {
   audioSource: "microphone" | "system";
   inputDevice: string;
   captureProtection?: boolean;
+  clickThrough?: boolean;
   answerShortcut?: string;
   visibilityShortcut?: string;
   answerProvider?: AnswerProvider;
@@ -144,6 +149,8 @@ export interface VoiceEvent {
   text: string;
   source: "microphone" | "system";
   time: number;
+  startMs?: number;
+  endMs?: number;
 }
 export interface VoiceProgress {
   progress: number;
@@ -156,6 +163,7 @@ export interface InputDevice {
 export type CompanionMode = "main" | "pin" | "answer";
 export interface CompanionConfiguration {
   captureProtection: boolean;
+  clickThrough?: boolean;
   answerShortcut: string;
   visibilityShortcut: string;
   meetingShortcut?: string;
@@ -163,6 +171,7 @@ export interface CompanionConfiguration {
 export interface CompanionState {
   mode: CompanionMode;
   captureProtection: "best-effort" | "unavailable" | "disabled";
+  clickThrough?: boolean;
   shortcutAvailable?: boolean;
   visibilityShortcutAvailable?: boolean;
   emergencyShortcutAvailable?: boolean;
@@ -210,6 +219,7 @@ export interface DesktopAPI {
   onVoiceProgress(callback: (event: VoiceProgress) => void): () => void;
   setupVoice(): Promise<void>;
   exportSession(session: InterviewSession): Promise<boolean>;
+  exportSubtitles?(session: InterviewSession, format: "srt" | "vtt"): Promise<boolean>;
   importContext(): Promise<{ name: string; text: string } | null>;
   copyText?(text: string): Promise<void>;
   startDragging?(): Promise<void>;

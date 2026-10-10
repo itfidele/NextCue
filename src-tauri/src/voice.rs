@@ -64,6 +64,8 @@ struct Transcript {
     text: String,
     source: String,
     time: u64,
+    start_ms: u64,
+    end_ms: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -92,6 +94,7 @@ struct AudioChunk {
     language: String,
     source: String,
     time: u64,
+    duration_ms: u64,
     samples: Vec<f32>,
     app: AppHandle,
 }
@@ -605,14 +608,15 @@ fn inference_worker(
         if current.load(Ordering::Acquire) != chunk.epoch || !has_speech(&chunk.samples) {
             continue;
         }
-        let text = match decode_samples(
+        let segments = match decode_samples(
             &mut state,
             &chunk.samples,
             &chunk.language,
             current.clone(),
             chunk.epoch,
+            chunk.duration_ms,
         ) {
-            Ok(text) => text,
+            Ok(segments) => segments,
             Err(error) => {
                 if current.load(Ordering::Acquire) == chunk.epoch {
                     emit_error(&chunk.app, &chunk.session_id, error);
@@ -620,14 +624,21 @@ fn inference_worker(
                 continue;
             }
         };
-        if !text.is_empty() && current.load(Ordering::Acquire) == chunk.epoch {
+        for segment in segments {
+            if current.load(Ordering::Acquire) != chunk.epoch {
+                break;
+            }
+            let start_ms = chunk.time.saturating_add(segment.start_ms);
+            let end_ms = chunk.time.saturating_add(segment.end_ms);
             let _ = chunk.app.emit(
                 "transcript",
                 Transcript {
-                    session_id: chunk.session_id,
-                    text,
-                    source: chunk.source,
-                    time: chunk.time,
+                    session_id: chunk.session_id.clone(),
+                    text: segment.text,
+                    source: chunk.source.clone(),
+                    time: start_ms,
+                    start_ms,
+                    end_ms,
                 },
             );
         }
@@ -640,9 +651,10 @@ fn decode_samples(
     language: &str,
     current: Arc<AtomicU64>,
     epoch: u64,
-) -> Result<String, String> {
+    duration_ms: u64,
+) -> Result<Vec<DecodedSegment>, String> {
     if current.load(Ordering::Acquire) != epoch || !has_speech(samples) {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(thread::available_parallelism().map_or(4, |n| n.get().min(4)) as i32);
@@ -653,7 +665,7 @@ fn decode_samples(
     });
     params.set_translate(false);
     params.set_no_context(true);
-    params.set_no_timestamps(true);
+    params.set_no_timestamps(false);
     params.set_print_realtime(false);
     params.set_print_progress(false);
     params.set_print_timestamps(false);
@@ -674,17 +686,58 @@ fn decode_samples(
         .full(params, samples)
         .map_err(|e| format!("Local transcription failed: {e}"))?;
     if current.load(Ordering::Acquire) != epoch {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
-    let mut text = String::new();
+    let mut segments = Vec::new();
     for segment in state.as_iter() {
         if segment.no_speech_probability() < 0.6 {
             if let Ok(words) = segment.to_str_lossy() {
-                text.push_str(&words);
+                if let Some(segment) = timed_segment(
+                    &words,
+                    segment.start_timestamp(),
+                    segment.end_timestamp(),
+                    duration_ms,
+                ) {
+                    segments.push(segment);
+                }
             }
         }
     }
-    Ok(text.trim().to_string())
+    Ok(segments)
+}
+
+#[derive(Debug)]
+struct DecodedSegment {
+    text: String,
+    // Millisecond offsets within the captured chunk, before conversion to epoch time.
+    start_ms: u64,
+    end_ms: u64,
+}
+
+fn timed_segment(
+    text: &str,
+    start_centiseconds: i64,
+    end_centiseconds: i64,
+    duration_ms: u64,
+) -> Option<DecodedSegment> {
+    let text = text.trim();
+    // Whisper timestamps use 10 ms units. Clamp to captured PCM, excluding padding
+    // added to help the model recognize a short final utterance.
+    let offset_ms = |centiseconds: i64| {
+        (centiseconds.max(0) as u64)
+            .saturating_mul(10)
+            .min(duration_ms)
+    };
+    let start_ms = offset_ms(start_centiseconds);
+    let end_ms = offset_ms(end_centiseconds);
+    if text.is_empty() || end_ms <= start_ms {
+        return None;
+    }
+    Some(DecodedSegment {
+        text: text.into(),
+        start_ms,
+        end_ms,
+    })
 }
 
 struct AbortContext {
@@ -761,7 +814,7 @@ fn capture_audio(
     // Stream teardown occurs on its owning thread, including platforms where Stream is !Send.
     drop(stream);
     if let Ok(mut buffer) = chunker.lock() {
-        if let Some(samples) = buffer.flush() {
+        if let Some(audio) = buffer.flush() {
             if current.load(Ordering::Acquire) == epoch {
                 send_until(
                     &sender,
@@ -770,8 +823,9 @@ fn capture_audio(
                         session_id: request.session_id,
                         language: request.language,
                         source: request.source,
-                        time: now_ms(),
-                        samples,
+                        time: audio.time,
+                        duration_ms: audio.duration_ms,
+                        samples: audio.samples,
                         app,
                     }),
                     Instant::now() + Duration::from_secs(10),
@@ -907,23 +961,31 @@ where
 {
     use cpal::Sample;
     let channels = config.channels as usize;
+    let source_rate = config.sample_rate.0 as u64;
     let error_app = app.clone();
     let error_session = request.session_id.clone();
     let error_epoch = current.clone();
     let output_failed = failed.clone();
     let mut last_level = Instant::now();
     let mut queue_warned = false;
-    device.build_input_stream(config, move |data: &[T], _| {
-        last_packet.store(now_ms(), Ordering::Release);
+    device.build_input_stream(config, move |data: &[T], info| {
+        let received_ms = now_ms();
+        last_packet.store(received_ms, Ordering::Release);
         if current.load(Ordering::Acquire) != epoch {return;}
         let Ok(mut buffer) = chunker.try_lock() else {return;};
         let mut energy = 0_f32;
         let frames = data.len() / channels;
-        for frame in data.chunks_exact(channels) {
+        let timestamp = info.timestamp();
+        let capture_delay = timestamp.callback.duration_since(&timestamp.capture)
+            .map(|delay| delay.as_millis() as u64)
+            .unwrap_or(frames as u64 * 1_000 / source_rate);
+        let packet_start = received_ms.saturating_sub(capture_delay);
+        for (index, frame) in data.chunks_exact(channels).enumerate() {
             let mono = frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / channels as f32;
             energy += mono * mono;
-            if let Some(samples) = buffer.push(mono) {
-                let chunk = AudioChunk {epoch, session_id: request.session_id.clone(), language: request.language.clone(), source: request.source.clone(), time: now_ms(), samples, app: app.clone()};
+            let sample_time = packet_start.saturating_add(index as u64 * 1_000 / source_rate);
+            if let Some(audio) = buffer.push(mono, sample_time) {
+                let chunk = AudioChunk {epoch, session_id: request.session_id.clone(), language: request.language.clone(), source: request.source.clone(), time: audio.time, duration_ms: audio.duration_ms, samples: audio.samples, app: app.clone()};
                 match sender.try_send(Work::Audio(chunk)) {
                     Ok(()) => queue_warned = false,
                     Err(TrySendError::Full(_)) => {
@@ -944,6 +1006,13 @@ where
     }, None)
 }
 
+/// PCM retains its capture start and duration even when inference is queued or PCM is padded.
+struct CapturedAudio {
+    time: u64,
+    duration_ms: u64,
+    samples: Vec<f32>,
+}
+
 /// Continuous resampling keeps phase across callbacks; capture buffers stay below six seconds.
 struct Chunker {
     source_rate: f64,
@@ -952,6 +1021,7 @@ struct Chunker {
     previous: f32,
     samples: Vec<f32>,
     trailing_silence: usize,
+    start_ms: Option<u64>,
 }
 
 impl Chunker {
@@ -963,10 +1033,11 @@ impl Chunker {
             previous: 0.0,
             samples: Vec::with_capacity(CHUNK_SAMPLES),
             trailing_silence: 0,
+            start_ms: None,
         }
     }
 
-    fn push(&mut self, sample: f32) -> Option<Vec<f32>> {
+    fn push(&mut self, sample: f32, time: u64) -> Option<CapturedAudio> {
         let sample = if sample.is_finite() {
             sample.clamp(-1.0, 1.0)
         } else {
@@ -980,6 +1051,7 @@ impl Chunker {
                 let fraction = (self.next - (self.index - 1) as f64).clamp(0.0, 1.0) as f32;
                 self.previous + (sample - self.previous) * fraction
             };
+            self.start_ms.get_or_insert(time);
             self.samples.push(value);
             self.trailing_silence = if value.abs() < 0.006 {
                 self.trailing_silence + 1
@@ -1000,17 +1072,23 @@ impl Chunker {
         finished
     }
 
-    fn flush(&mut self) -> Option<Vec<f32>> {
+    fn flush(&mut self) -> Option<CapturedAudio> {
         self.trailing_silence = 0;
+        let time = self.start_ms.take()?;
         let mut samples = std::mem::replace(&mut self.samples, Vec::with_capacity(CHUNK_SAMPLES));
         if samples.len() < RATE / 4 || !has_speech(&samples) {
             return None;
         }
+        let duration_ms = (samples.len() as u64 * 1_000).div_ceil(RATE as u64);
         // Whisper handles a final short utterance better with at least one second of PCM.
         if samples.len() < RATE {
             samples.resize(RATE, 0.0);
         }
-        Some(samples)
+        Some(CapturedAudio {
+            time,
+            duration_ms,
+            samples,
+        })
     }
 }
 
@@ -1150,13 +1228,16 @@ mod mac_system_audio {
                 };
                 if mono.is_empty() {return;}
                 decode_failures.store(0, Ordering::Release);
-                output_packet.store(now_ms(), Ordering::Release);
+                let received_ms = now_ms();
+                output_packet.store(received_ms, Ordering::Release);
                 let Ok(mut buffer) = output_chunker.try_lock() else {return;};
                 if buffer.source_rate as u32 != rate {*buffer = Chunker::new(rate);}
                 let energy = mono.iter().map(|value| value * value).sum::<f32>() / mono.len() as f32;
-                for value in mono {
-                    if let Some(samples) = buffer.push(value) {
-                        let chunk = AudioChunk {epoch, session_id: output_request.session_id.clone(), language: output_request.language.clone(), source: "system".into(), time: now_ms(), samples, app: output_app.clone()};
+                let packet_start = received_ms.saturating_sub(mono.len() as u64 * 1_000 / rate as u64);
+                for (index, value) in mono.into_iter().enumerate() {
+                    let sample_time = packet_start.saturating_add(index as u64 * 1_000 / rate as u64);
+                    if let Some(audio) = buffer.push(value, sample_time) {
+                        let chunk = AudioChunk {epoch, session_id: output_request.session_id.clone(), language: output_request.language.clone(), source: "system".into(), time: audio.time, duration_ms: audio.duration_ms, samples: audio.samples, app: output_app.clone()};
                         match output_sender.try_send(Work::Audio(chunk)) {
                             Ok(()) => {warned.store(false, Ordering::Release);}
                             Err(TrySendError::Full(_)) => {
@@ -1221,7 +1302,7 @@ mod mac_system_audio {
             .map_err(|e| format!("Cannot stop system audio capture: {e}"))?;
         drop(stream);
         if let Ok(mut buffer) = chunker.lock() {
-            if let Some(samples) = buffer.flush() {
+            if let Some(audio) = buffer.flush() {
                 if current.load(Ordering::Acquire) == epoch {
                     send_until(
                         &sender,
@@ -1230,8 +1311,9 @@ mod mac_system_audio {
                             session_id: request.session_id,
                             language: request.language,
                             source: "system".into(),
-                            time: now_ms(),
-                            samples,
+                            time: audio.time,
+                            duration_ms: audio.duration_ms,
+                            samples: audio.samples,
                             app,
                         }),
                         Instant::now() + Duration::from_secs(10),
@@ -1253,13 +1335,13 @@ mod tests {
         let mut lengths = Vec::new();
         for i in 0..48_000 * 19 {
             let value = ((i as f32 / 48_000.0) * 440.0 * std::f32::consts::TAU).sin() * 0.2;
-            if let Some(samples) = chunker.push(value) {
-                lengths.push(samples.len());
+            if let Some(audio) = chunker.push(value, i as u64 * 1_000 / 48_000) {
+                lengths.push(audio.samples.len());
             }
             assert!(chunker.samples.len() < CHUNK_SAMPLES);
         }
         assert_eq!(lengths, vec![CHUNK_SAMPLES; 3]);
-        assert!(chunker.flush().unwrap().len().abs_diff(RATE) <= 1);
+        assert!(chunker.flush().unwrap().samples.len().abs_diff(RATE) <= 1);
     }
 
     #[test]
@@ -1267,7 +1349,10 @@ mod tests {
         let mut chunker = Chunker::new(44_100);
         for i in 0..44_100 * 15 {
             assert!(chunker
-                .push(if i % 2 == 0 { 0.0 } else { f32::NAN })
+                .push(
+                    if i % 2 == 0 { 0.0 } else { f32::NAN },
+                    i as u64 * 1_000 / 44_100
+                )
                 .is_none());
         }
         assert!(chunker.flush().is_none());
@@ -1277,21 +1362,66 @@ mod tests {
     #[test]
     fn pause_flushes_a_question_and_stop_flushes_short_tail() {
         let mut chunker = Chunker::new(16_000);
-        for _ in 0..RATE {
-            assert!(chunker.push(0.1).is_none());
+        for i in 0..RATE {
+            assert!(chunker.push(0.1, i as u64 * 1_000 / RATE as u64).is_none());
         }
         let mut delivered = None;
-        for _ in 0..RATE {
-            if let Some(chunk) = chunker.push(0.0) {
+        for i in RATE..RATE * 2 {
+            if let Some(chunk) = chunker.push(0.0, i as u64 * 1_000 / RATE as u64) {
                 delivered = Some(chunk);
             }
         }
-        assert_eq!(delivered.unwrap().len(), RATE * 2);
-        for _ in 0..RATE / 2 {
-            chunker.push(0.1);
+        let delivered = delivered.unwrap();
+        assert_eq!(delivered.samples.len(), RATE * 2);
+        assert_eq!((delivered.time, delivered.duration_ms), (0, 2_000));
+        for i in RATE * 2..RATE * 5 / 2 {
+            chunker.push(0.1, i as u64 * 1_000 / RATE as u64);
         }
-        assert_eq!(chunker.flush().unwrap().len(), RATE);
+        let tail = chunker.flush().unwrap();
+        assert_eq!(tail.samples.len(), RATE);
+        assert_eq!((tail.time, tail.duration_ms), (2_000, 500));
         assert!(chunker.flush().is_none());
+    }
+
+    #[test]
+    fn subtitle_segments_keep_whisper_offsets_and_exclude_tail_padding() {
+        let first = timed_segment("  First sentence.  ", 12, 154, 2_375).unwrap();
+        assert_eq!(first.text, "First sentence.");
+        assert_eq!((first.start_ms, first.end_ms), (120, 1_540));
+        let final_segment = timed_segment("Short tail.", 154, 300, 2_375).unwrap();
+        assert_eq!(
+            (final_segment.start_ms, final_segment.end_ms),
+            (1_540, 2_375)
+        );
+        assert!(timed_segment("Padding only.", 240, 300, 2_375).is_none());
+        assert!(timed_segment(" ", 0, 100, 2_375).is_none());
+        assert!(timed_segment("Reversed.", 100, 99, 2_375).is_none());
+        let negative_start = timed_segment("Start.", -1, 10, 2_375).unwrap();
+        assert_eq!((negative_start.start_ms, negative_start.end_ms), (0, 100));
+    }
+
+    #[test]
+    fn discarded_silence_and_new_packets_do_not_reuse_old_capture_times() {
+        let mut chunker = Chunker::new(RATE as u32);
+        for i in 0..CHUNK_SAMPLES {
+            assert!(chunker
+                .push(0.0, 10_000 + i as u64 * 1_000 / RATE as u64)
+                .is_none());
+        }
+        for i in 0..RATE / 2 {
+            assert!(chunker
+                .push(0.1, 23_000 + i as u64 * 1_000 / RATE as u64)
+                .is_none());
+        }
+        let tail = chunker.flush().unwrap();
+        assert_eq!((tail.time, tail.duration_ms), (23_000, 500));
+        assert_eq!(tail.samples.len(), RATE);
+        // Delivery may occur long after capture; event time always describes the audio.
+        let segment = timed_segment("Hello.", 10, 100, tail.duration_ms).unwrap();
+        assert_eq!(
+            (tail.time + segment.start_ms, tail.time + segment.end_ms),
+            (23_100, 23_500)
+        );
     }
 
     #[test]
@@ -1373,32 +1503,51 @@ mod tests {
         let mut state = context.create_state().unwrap();
         let epoch = Arc::new(AtomicU64::new(1));
         let expected = std::env::var("NEXTCUE_TEST_EXPECT").unwrap_or_else(|_| "country".into());
+        let duration_ms = (samples.len() as u64 * 1_000).div_ceil(RATE as u64);
+        let transcript_text = |segments: &[DecodedSegment]| {
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         for _ in 0..3 {
-            let text = decode_samples(&mut state, &samples, "en", epoch.clone(), 1).unwrap();
+            let segments =
+                decode_samples(&mut state, &samples, "en", epoch.clone(), 1, duration_ms).unwrap();
+            assert!(!segments.is_empty());
+            assert!(segments
+                .iter()
+                .all(|segment| segment.start_ms < segment.end_ms && segment.end_ms <= duration_ms));
+            let text = transcript_text(&segments);
             eprintln!("Offline transcript: {text}");
             assert!(text.to_lowercase().contains(&expected.to_lowercase()));
         }
         assert!(
-            decode_samples(&mut state, &[0.0; RATE], "en", epoch.clone(), 1)
+            decode_samples(&mut state, &[0.0; RATE], "en", epoch.clone(), 1, 1_000)
                 .unwrap()
                 .is_empty()
         );
         epoch.store(2, Ordering::Release);
-        assert!(decode_samples(&mut state, &samples, "en", epoch.clone(), 1)
-            .unwrap()
-            .is_empty());
+        assert!(
+            decode_samples(&mut state, &samples, "en", epoch.clone(), 1, duration_ms)
+                .unwrap()
+                .is_empty()
+        );
         epoch.store(3, Ordering::Release);
         let cancelled = epoch.clone();
         let cancel_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             cancelled.store(4, Ordering::Release);
         });
-        let cancelled_result = decode_samples(&mut state, &samples, "en", epoch.clone(), 3);
+        let cancelled_result =
+            decode_samples(&mut state, &samples, "en", epoch.clone(), 3, duration_ms);
         cancel_thread.join().unwrap();
         assert!(cancelled_result.is_err() || cancelled_result.unwrap().is_empty());
         // A cancelled graph must not poison the persistent worker's next interview.
         epoch.store(5, Ordering::Release);
-        let recovered = decode_samples(&mut state, &samples, "en", epoch, 5).unwrap();
-        assert!(recovered.to_lowercase().contains(&expected.to_lowercase()));
+        let recovered = decode_samples(&mut state, &samples, "en", epoch, 5, duration_ms).unwrap();
+        assert!(transcript_text(&recovered)
+            .to_lowercase()
+            .contains(&expected.to_lowercase()));
     }
 }

@@ -55,11 +55,13 @@ pub struct CompanionStatus {
     visibility_shortcut: String,
     meeting_shortcut: String,
     capture_protection_enabled: bool,
+    click_through: bool,
 }
 
 #[derive(Clone)]
 struct Preferences {
     capture_protection_enabled: bool,
+    click_through: bool,
     answer_shortcut: String,
     visibility_shortcut: String,
     meeting_shortcut: String,
@@ -75,6 +77,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             capture_protection_enabled: true,
+            click_through: false,
             answer_shortcut: DEFAULT_ANSWER_SHORTCUT.into(),
             visibility_shortcut: DEFAULT_VISIBILITY_SHORTCUT.into(),
             meeting_shortcut: DEFAULT_MEETING_SHORTCUT.into(),
@@ -308,7 +311,8 @@ impl WorkspaceBounds {
         })
     }
 
-    fn restore(&self, window: &WebviewWindow) -> tauri::Result<()> {
+    fn restore(&self, window: &WebviewWindow, focus: bool) -> tauri::Result<()> {
+        window.set_ignore_cursor_events(false)?;
         window.set_focusable(true)?;
         // Tao's macOS decoration update captures the current resizable value
         // and applies that style asynchronously. Restore resizing first so its
@@ -329,8 +333,74 @@ impl WorkspaceBounds {
         if let Some(maximizable) = self.maximizable {
             window.set_maximizable(maximizable)?;
         }
-        window.set_focus()
+        if focus {
+            window.set_focus()?;
+        }
+        Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WindowPolicy {
+    focusable: bool,
+    ignore_cursor_events: bool,
+    application_visible: bool,
+}
+
+fn window_policy(mode: CompanionMode, visible: bool, click_through: bool) -> WindowPolicy {
+    let main = mode == CompanionMode::Main;
+    WindowPolicy {
+        focusable: main,
+        ignore_cursor_events: !main && click_through,
+        application_visible: main && visible,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RevealIntent {
+    Recovery,
+    Answer,
+}
+
+fn visibility_mode(
+    mode: CompanionMode,
+    visible: bool,
+    click_through: bool,
+    intent: RevealIntent,
+) -> CompanionMode {
+    if visible && click_through && intent == RevealIntent::Recovery {
+        CompanionMode::Main
+    } else {
+        mode
+    }
+}
+
+fn apply_interaction(
+    window: &WebviewWindow,
+    mode: CompanionMode,
+    click_through: bool,
+) -> tauri::Result<()> {
+    let policy = window_policy(mode, true, click_through);
+    window.set_ignore_cursor_events(policy.ignore_cursor_events)?;
+    window.set_focusable(policy.focusable)
+}
+
+fn apply_presence(window: &WebviewWindow, mode: CompanionMode, visible: bool) -> tauri::Result<()> {
+    let policy = window_policy(mode, visible, false);
+    #[cfg(target_os = "macos")]
+    {
+        // AppHandle's supported setter dispatches to Tauri's main event loop;
+        // do not wait on a callback while holding the transition/state locks.
+        window
+            .app_handle()
+            .set_activation_policy(if policy.application_visible {
+                tauri::ActivationPolicy::Regular
+            } else {
+                tauri::ActivationPolicy::Accessory
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    window.set_skip_taskbar(!policy.application_visible)
 }
 
 #[derive(Default)]
@@ -349,6 +419,7 @@ impl Default for Point {
 }
 
 pub struct CompanionService {
+    transition: Mutex<()>,
     state: Mutex<CompanionState>,
     position_file: PathBuf,
     preferences: Mutex<Preferences>,
@@ -364,6 +435,7 @@ impl CompanionService {
             .and_then(|_| fs::read(&position_file).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         Self {
+            transition: Mutex::new(()),
             state: Mutex::new(CompanionState {
                 anchor,
                 ..Default::default()
@@ -412,6 +484,7 @@ impl CompanionService {
                 DEFAULT_ANSWER_SHORTCUT.into(),
                 DEFAULT_VISIBILITY_SHORTCUT.into(),
                 DEFAULT_MEETING_SHORTCUT.into(),
+                false,
             );
         }
     }
@@ -462,7 +535,20 @@ impl CompanionService {
         answer_shortcut: String,
         visibility_shortcut: String,
         meeting_shortcut: String,
+        click_through: bool,
     ) -> Result<CompanionStatus, String> {
+        let _transition = self
+            .transition
+            .lock()
+            .map_err(|_| "Cannot update the floating assistant.")?;
+        if click_through && !self.recovery_available() {
+            return Err("Set up an available hide/show shortcut or system tray before making the floating assistant click-through.".into());
+        }
+        let mode = self
+            .state
+            .lock()
+            .map_err(|_| "Cannot access the floating assistant.")?
+            .mode;
         #[cfg(desktop)]
         {
             let (answer_name, answer, visibility_name, visibility, meeting_name, meeting) =
@@ -508,6 +594,16 @@ impl CompanionService {
                     removed.push(*shortcut);
                 }
             }
+            if let Err(error) = apply_interaction(window, mode, click_through) {
+                for previous in removed {
+                    let _ = shortcuts.register(previous);
+                }
+                for newly_registered in added {
+                    let _ = shortcuts.unregister(newly_registered);
+                }
+                let _ = apply_interaction(window, mode, preferences.click_through);
+                return Err(format!("Cannot update click-through mode. The previous settings were retained: {error}"));
+            }
             preferences.registered = desired;
             preferences.answer_shortcut = answer_name;
             preferences.visibility_shortcut = visibility_name;
@@ -517,6 +613,7 @@ impl CompanionService {
             preferences.meeting_shortcut_available = true;
             preferences.emergency_shortcut_available = true;
             preferences.capture_protection_enabled = capture_protection_enabled;
+            preferences.click_through = click_through;
         }
         #[cfg(not(desktop))]
         {
@@ -525,7 +622,12 @@ impl CompanionService {
                 .preferences
                 .lock()
                 .map_err(|_| "Cannot update the assistant settings.")?;
+            if let Err(error) = apply_interaction(window, mode, click_through) {
+                let _ = apply_interaction(window, mode, preferences.click_through);
+                return Err(format!("Cannot update click-through mode. The previous settings were retained: {error}"));
+            }
             preferences.capture_protection_enabled = capture_protection_enabled;
+            preferences.click_through = click_through;
         }
         self.status(window)
     }
@@ -557,6 +659,7 @@ impl CompanionService {
             visibility_shortcut: preferences.visibility_shortcut,
             meeting_shortcut: preferences.meeting_shortcut,
             capture_protection_enabled: preferences.capture_protection_enabled,
+            click_through: preferences.click_through,
         })
     }
 
@@ -578,13 +681,53 @@ impl CompanionService {
         window: &WebviewWindow,
         visible: bool,
     ) -> Result<CompanionStatus, String> {
+        let _transition = self
+            .transition
+            .lock()
+            .map_err(|_| "Cannot update the floating assistant.")?;
+        self.set_visible_locked(window, visible, RevealIntent::Recovery)
+    }
+
+    pub fn reveal_for_answer(&self, window: &WebviewWindow) -> Result<CompanionStatus, String> {
+        let _transition = self
+            .transition
+            .lock()
+            .map_err(|_| "Cannot update the floating assistant.")?;
+        self.set_visible_locked(window, true, RevealIntent::Answer)
+    }
+
+    fn set_visible_locked(
+        &self,
+        window: &WebviewWindow,
+        visible: bool,
+        intent: RevealIntent,
+    ) -> Result<CompanionStatus, String> {
+        let mut mode = self
+            .state
+            .lock()
+            .map_err(|_| "Cannot access the floating assistant.")?
+            .mode;
+        let click_through = self
+            .preferences
+            .lock()
+            .map_err(|_| "Cannot access the assistant settings.")?
+            .click_through;
         if visible {
-            window.show().map_err(|error| error.to_string())?;
-            let mode = self
-                .state
-                .lock()
-                .map_err(|_| "Cannot access the floating assistant.")?
-                .mode;
+            let restored_mode = visibility_mode(mode, visible, click_through, intent);
+            if restored_mode != mode {
+                // The visibility shortcut must recover usable mouse controls
+                // even when the tray is unavailable and the card ignores clicks.
+                self.set_mode_locked(window, restored_mode)?;
+                mode = restored_mode;
+            }
+            // Restore the workspace's Dock/taskbar and input behavior before
+            // showing it, even when a click-through card was previously hidden.
+            apply_presence(window, mode, true).map_err(|error| error.to_string())?;
+            apply_interaction(window, mode, click_through).map_err(|error| error.to_string())?;
+            if let Err(error) = window.show() {
+                let _ = apply_presence(window, mode, false);
+                return Err(error.to_string());
+            }
             if mode == CompanionMode::Main {
                 window.set_focus().map_err(|error| error.to_string())?;
             }
@@ -603,6 +746,11 @@ impl CompanionService {
             }
             drop(preferences);
             window.hide().map_err(|error| error.to_string())?;
+            if let Err(error) = apply_presence(window, mode, false) {
+                let _ = apply_presence(window, mode, true);
+                let _ = window.show();
+                return Err(error.to_string());
+            }
         }
         let status = self.status(window)?;
         let _ = window.emit("companion-visibility", &status);
@@ -648,6 +796,27 @@ impl CompanionService {
         window: &WebviewWindow,
         mode: CompanionMode,
     ) -> Result<CompanionStatus, String> {
+        let _transition = self
+            .transition
+            .lock()
+            .map_err(|_| "Cannot update the floating assistant.")?;
+        self.set_mode_locked(window, mode)
+    }
+
+    fn set_mode_locked(
+        &self,
+        window: &WebviewWindow,
+        mode: CompanionMode,
+    ) -> Result<CompanionStatus, String> {
+        let click_through = self
+            .preferences
+            .lock()
+            .map_err(|_| "Cannot access the assistant settings.")?
+            .click_through;
+        if mode != CompanionMode::Main && click_through && !self.recovery_available() {
+            return Err("Set up an available hide/show shortcut or system tray before making the floating assistant click-through.".into());
+        }
+        let visible = window.is_visible().map_err(|error| error.to_string())?;
         let mut state = self
             .state
             .lock()
@@ -663,8 +832,12 @@ impl CompanionService {
         }
 
         if mode == CompanionMode::Main {
+            apply_presence(window, mode, visible).map_err(|error| error.to_string())?;
+            apply_interaction(window, mode, click_through).map_err(|error| error.to_string())?;
             if let Some(workspace) = &state.workspace {
-                workspace.restore(window).map_err(|e| e.to_string())?;
+                workspace
+                    .restore(window, visible)
+                    .map_err(|e| e.to_string())?;
             }
             state.workspace = None;
             state.mode = mode;
@@ -711,15 +884,16 @@ impl CompanionService {
             }
 
             let change_window = || -> tauri::Result<()> {
+                apply_presence(window, mode, visible)?;
                 if window.is_fullscreen()? {
                     window.set_fullscreen(false)?;
                 }
                 if window.is_maximized()? {
                     window.unmaximize()?;
                 }
-                // Mouse controls remain usable, but expanding answers does not
-                // explicitly activate the app or steal another app's focus.
-                window.set_focusable(false)?;
+                // Floating answers never take keyboard focus. Optional pointer
+                // passthrough lets the app underneath receive every click.
+                apply_interaction(window, mode, click_through)?;
                 window.set_min_size(None::<LogicalSize<f64>>)?;
                 window.set_resizable(false)?;
                 window.set_decorations(false)?;
@@ -732,8 +906,10 @@ impl CompanionService {
             if let Err(error) = change_window() {
                 // Always provide an escape back to the workspace after a
                 // platform rejects an operation midway through the change.
+                let _ = apply_presence(window, CompanionMode::Main, visible);
+                let _ = apply_interaction(window, CompanionMode::Main, false);
                 if let Some(workspace) = &state.workspace {
-                    let _ = workspace.restore(window);
+                    let _ = workspace.restore(window, visible);
                 }
                 state.mode = CompanionMode::Main;
                 state.workspace = None;
@@ -887,17 +1063,62 @@ mod tests {
             visibility_shortcut: DEFAULT_VISIBILITY_SHORTCUT.into(),
             meeting_shortcut: DEFAULT_MEETING_SHORTCUT.into(),
             capture_protection_enabled: true,
+            click_through: true,
         })
         .unwrap();
         assert_eq!(status["mode"], "answer");
         assert_eq!(status["captureProtection"], "best-effort");
         assert_eq!(status["shortcutAvailable"], true);
         assert_eq!(status["visible"], true);
+        assert_eq!(status["clickThrough"], true);
         assert_eq!(status["visibilityShortcut"], DEFAULT_VISIBILITY_SHORTCUT);
         assert_eq!(
             serde_json::to_value(CaptureProtection::Disabled).unwrap(),
             "disabled"
         );
+    }
+
+    #[test]
+    fn workspace_always_accepts_input_and_only_visible_main_has_app_presence() {
+        assert!(!Preferences::default().click_through);
+        for visible in [false, true] {
+            for click_through in [false, true] {
+                let main = window_policy(CompanionMode::Main, visible, click_through);
+                assert!(main.focusable);
+                assert!(!main.ignore_cursor_events);
+                assert_eq!(main.application_visible, visible);
+                for mode in [CompanionMode::Pin, CompanionMode::Answer] {
+                    let floating = window_policy(mode, visible, click_through);
+                    assert!(!floating.focusable);
+                    assert_eq!(floating.ignore_cursor_events, click_through);
+                    assert!(!floating.application_visible);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn visibility_shortcut_recovers_mouse_controls_from_click_through_cards() {
+        for mode in [CompanionMode::Pin, CompanionMode::Answer] {
+            assert_eq!(
+                visibility_mode(mode, false, true, RevealIntent::Recovery),
+                mode
+            );
+            assert_eq!(
+                visibility_mode(mode, true, false, RevealIntent::Recovery),
+                mode
+            );
+            let restored = visibility_mode(mode, true, true, RevealIntent::Recovery);
+            assert_eq!(restored, CompanionMode::Main);
+            let policy = window_policy(restored, true, true);
+            assert!(!policy.ignore_cursor_events);
+            assert!(policy.focusable && policy.application_visible);
+            let answer = visibility_mode(mode, true, true, RevealIntent::Answer);
+            assert_eq!(answer, mode);
+            let answer_policy = window_policy(answer, true, true);
+            assert!(answer_policy.ignore_cursor_events);
+            assert!(!answer_policy.focusable && !answer_policy.application_visible);
+        }
     }
 
     #[cfg(desktop)]
