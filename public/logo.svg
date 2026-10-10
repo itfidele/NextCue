@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="surface" x1="80" y1="20" x2="454" y2="495" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7587F4"/><stop offset=".48" stop-color="#5A67DE"/><stop offset="1" stop-color="#4E48BC"/>
+    </linearGradient>
+    <linearGradient id="cue" x1="136" y1="111" x2="365" y2="376" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff"/><stop offset="1" stop-color="#EBEEFF"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="183" y1="191" x2="336" y2="278" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7484E9"/><stop offset="1" stop-color="#5B57C7"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="115" fill="url(#surface)"/>
+  <rect x="26" y="26" width="460" height="460" rx="106" stroke="#fff" stroke-opacity=".13" stroke-width="2"/>
+  <path d="M122 220c0-65 49-111 116-111h37c67 0 116 46 116 111v35c0 64-49 111-116 111h-44l-66 41c-12 7-26-2-23-16l10-47c-20-19-30-44-30-73v-51Z" fill="url(#cue)"/>
+  <rect x="181" y="209" width="29" height="60" rx="14.5" fill="url(#wave)"/>
+  <rect x="242" y="176" width="29" height="126" rx="14.5" fill="url(#wave)"/>
+  <rect x="303" y="196" width="29" height="86" rx="14.5" fill="url(#wave)"/>
+  <circle cx="379" cy="137" r="28" fill="#D9D3FF" stroke="#6270E1" stroke-width="9"/>
+</svg>

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+release/
+.venv/
+.cache/
+.env*
+!.env.example
+*.log
+test-results/
+playwright-report/
+.DS_Store
+src-tauri/target/
