@@ -926,6 +926,31 @@ test("hiding and showing the assistant preserves listening, an answer, and the c
       page.evaluate(() => (window as any).__testCompanionVisibilityCalls),
     )
     .toEqual([false]);
+  await expect(page.locator(".assistant-hidden")).toHaveAttribute(
+    "aria-hidden",
+    "true",
+  );
+  await expect(page.locator(".companion-card, .markdown, textarea")).toHaveCount(
+    0,
+  );
+  await expect(page.locator("body")).not.toContainText("A grounded");
+  // Generation can finish while hidden, but a local keyboard event must not
+  // start another answer after the first request has completed.
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          JSON.parse(localStorage.getItem("test-state") || "null")
+            ?.sessions?.[0]?.answers?.length || 0,
+      ),
+    )
+    .toBe(1);
+  await page.keyboard.press("Control+Enter");
+  await page.keyboard.press("Meta+Enter");
+  await page.waitForTimeout(100);
+  expect(
+    await page.evaluate(() => (window as any).__testRequests.length),
+  ).toBe(1);
   await page.evaluate(() =>
     (window as any).__testEmit("companion-visibility", { visible: true }),
   );
@@ -953,6 +978,23 @@ test("hiding and showing the assistant preserves listening, an answer, and the c
   await expect(
     page.getByRole("button", { name: "Pause listening", exact: true }),
   ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Hide assistant", exact: true })
+    .click();
+  await expect(page.getByLabel("Interview question")).toHaveCount(0);
+  await expect(page.locator(".markdown")).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText(
+    "Private screen sharing",
+  );
+  await expect(page.locator("body")).not.toContainText(
+    "Keep this draft while hidden",
+  );
+  await page.evaluate(() =>
+    (window as any).__testEmit("companion-visibility", { visible: true }),
+  );
+  await expect(page.getByLabel("Interview question")).toHaveValue(
+    "Keep this draft while hidden",
+  );
   const after = await page.evaluate(() => ({
     session: (window as any).__testActiveSession,
     stops: (window as any).__testStopListeningCalls,
@@ -960,6 +1002,65 @@ test("hiding and showing the assistant preserves listening, an answer, and the c
     requests: (window as any).__testRequests.length,
   }));
   expect(after).toEqual({ ...before, cancellations: [], requests: 1 });
+});
+
+test("answer keyboard shortcuts apply only to the visible live Answer tab", async ({
+  page,
+}) => {
+  await create(page, "Keyboard navigation");
+  await page.getByLabel("Interview question").fill("Explain your Rust work.");
+  const requests = () =>
+    page.evaluate(() => (window as any).__testRequests.length);
+  const pressAnswerKeys = async () => {
+    await page.keyboard.press("Control+Enter");
+    await page.keyboard.press("Meta+Enter");
+    await page.waitForTimeout(100);
+  };
+
+  await page.getByLabel("Session options", { exact: true }).click();
+  await page
+    .getByRole("button", { name: "Edit background", exact: true })
+    .click();
+  await page.getByRole("dialog").getByLabel("Your background").focus();
+  await pressAnswerKeys();
+  expect(await requests()).toBe(0);
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.getByRole("button", { name: "Close dialog", exact: true }).click();
+
+  await page.getByRole("button", { name: "Recap", exact: true }).click();
+  const recap = page.getByRole("region", {
+    name: "Session recap",
+    exact: true,
+  });
+  await expect(recap).toHaveAttribute("tabindex", "0");
+  await recap.focus();
+  await expect(recap).toBeFocused();
+  await pressAnswerKeys();
+  expect(await requests()).toBe(0);
+
+  await page.getByRole("button", { name: "Answer", exact: true }).click();
+  const answer = page.getByRole("region", {
+    name: "Suggested answer",
+    exact: true,
+  });
+  await expect(answer).toHaveAttribute("tabindex", "0");
+  await answer.focus();
+  await expect(answer).toBeFocused();
+  await page.keyboard.press("Control+Enter");
+  await expect.poll(requests).toBe(1);
+  await expect(answer).toContainText(
+    "A grounded answer based on your background.",
+  );
+
+  await page.getByLabel("Interview question").fill("Describe another example.");
+  await page.keyboard.press("Meta+Enter");
+  await expect.poll(requests).toBe(2);
+  await expect(page.getByRole("button", { name: "Generate answer" })).toBeVisible();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByText(/use Tab and Shift\+Tab to move between/)).toBeVisible();
+  await page.getByLabel("Show answer shortcut", { exact: true }).focus();
+  await pressAnswerKeys();
+  expect(await requests()).toBe(2);
 });
 
 test("a startup shortcut conflict restores accepted native settings and keeps the draft for editing", async ({

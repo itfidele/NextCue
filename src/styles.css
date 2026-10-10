@@ -68,7 +68,8 @@ summary {
 }
 button:focus-visible,
 a:focus-visible,
-summary:focus-visible {
+summary:focus-visible,
+.answer-content:focus-visible {
   outline: 3px solid #7581ed;
 }
 a {
@@ -1901,6 +1902,10 @@ progress {
 }
 
 /* A transparent companion window contains only a movable pin or answer card. */
+.assistant-hidden {
+  height: 100vh;
+  background: transparent;
+}
 body[data-companion="pin"],
 body[data-companion="answer"] {
   min-width: 0;

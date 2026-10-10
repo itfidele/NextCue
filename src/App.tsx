@@ -735,7 +735,15 @@ export default function App() {
   }, []);
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        e.key === "Enter" &&
+        view === "live" &&
+        companion.mode === "main" &&
+        companion.visible !== false &&
+        answerTab === "answer" &&
+        modal === null
+      ) {
         e.preventDefault();
         void generateRef.current(
           question || selected?.transcript.at(-1)?.text || "",
@@ -744,7 +752,15 @@ export default function App() {
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [question, selected]);
+  }, [
+    question,
+    selected,
+    view,
+    companion.mode,
+    companion.visible,
+    answerTab,
+    modal,
+  ]);
 
   async function cancel() {
     const request = requestRef.current;
@@ -1275,6 +1291,18 @@ export default function App() {
       )}
     </div>
   );
+  const answerRegionLabel =
+    answerTab === "summary"
+      ? selected?.mode === "Meeting"
+        ? "Meeting notes"
+        : "Session recap"
+      : "Suggested answer";
+
+  // Keep session hooks mounted, but remove private content and controls from
+  // the webview whenever the native window is hidden. Recorders can still
+  // retain earlier frames; this is not a capture exclusion guarantee.
+  if (companion.visible === false)
+    return <div className="assistant-hidden" aria-hidden="true" />;
 
   if (companion.mode !== "main" && selected)
     return (
@@ -1376,7 +1404,11 @@ export default function App() {
                   : "Listening paused"}
               <span>{duration(selected.duration)}</span>
             </div>
-            <div className="companion-content">
+            <div
+              className="companion-content"
+              role="region"
+              aria-label={answerRegionLabel}
+            >
               {generating ||
               latestAnswer ||
               (answerTab === "summary" && selected.summary) ? (
@@ -2163,8 +2195,8 @@ export default function App() {
                     </strong>
                     <p>
                       {runtime.platform === "windows"
-                        ? "Windows requests capture exclusion. Recording and sharing apps may still capture it; check their preview."
-                        : "Capture exclusion is unavailable on this platform. Hide the assistant to remove it from both your screen and screen sharing."}
+                        ? "Windows requests capture exclusion while NextCue stays visible to you. Support depends on the recording or sharing app; check its preview."
+                        : "Capture exclusion is unavailable on this platform. Hide assistant removes NextCue from your desktop as well."}
                     </p>
                   </div>
                   <button
@@ -2268,9 +2300,18 @@ export default function App() {
                   available.
                 </p>
                 <p className="shortcut-status">
-                  To show the assistant in a recording, leave it visible and
-                  turn off capture exclusion. To hide it completely, use Hide
-                  assistant.
+                  Hide assistant hides the full app, pin, and answer card.
+                  Earlier footage and a recorder’s cached frame may remain;
+                  Hide cannot erase a recording or hide the system pointer.
+                </p>
+                <p className="shortcut-status">
+                  In the full app, use Tab and Shift+Tab to move between
+                  controls, Enter or Space to activate buttons, and{" "}
+                  <strong>
+                    {runtime.platform === "macos" ? "⌘" : "Ctrl"}+Enter
+                  </strong>{" "}
+                  to answer a question. Focus the answer to scroll with arrow
+                  keys or Page Up / Page Down.
                 </p>
               </section>
             </div>
@@ -2502,7 +2543,14 @@ export default function App() {
                     {contextInsight}
                   </p>
                 )}
-                <div className="answer-content">{answerBody}</div>
+                <div
+                  className="answer-content"
+                  tabIndex={0}
+                  role="region"
+                  aria-label={answerRegionLabel}
+                >
+                  {answerBody}
+                </div>
                 <div className="answer-footer">
                   {answerTab === "answer" ? (
                     <>
