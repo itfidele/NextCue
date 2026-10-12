@@ -5,5 +5,7 @@
   "type": "commonjs",
   "scripts": {
     "test": "node --test routes.test.js"
-  }
+  },
+  "author": "Fidele Kirezi Cyisa",
+  "license": "UNLICENSED"
 }

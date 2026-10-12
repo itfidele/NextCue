@@ -15,7 +15,6 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
-  ChevronRight,
   Clock3,
   Copy,
   Cpu,
@@ -27,8 +26,6 @@ import {
   GripHorizontal,
   Maximize2,
   MessageCircle,
-  PanelRight,
-  LayoutDashboard,
   Loader2,
   Mic,
   MoreHorizontal,
@@ -38,7 +35,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Send,
   Settings2,
   Monitor,
   ShieldCheck,
@@ -112,12 +108,6 @@ function sessionInputError(
   }
   return "";
 }
-const modelLabel = (name: string) =>
-  name
-    .split(":")[0]
-    .replace("qwen2.5", "Qwen 2.5")
-    .replace("phi4-mini", "Phi-4 Mini")
-    .replace("llama3.1", "Llama 3.1");
 const notesPrompt = (session?: InterviewSession) =>
   session?.mode === "Video" ? "Create video notes from the captured transcript." : "Create meeting notes.";
 const mediaTime = (session: InterviewSession, epochMs: number) => {

@@ -2,7 +2,8 @@
 name = "nextcue"
 version = "0.1.0"
 description = "Private local AI interview assistant"
-authors = ["NextCue"]
+authors = ["Fidele Kirezi Cyisa"]
+license-file = "../LICENSE"
 edition = "2021"
 
 [lib]
@@ -24,7 +25,6 @@ futures-util = "0.3"
 url = "2"
 cpal = "0.15"
 whisper-rs = "0.15"
-hound = "3.5"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
@@ -38,6 +38,9 @@ tauri-plugin-global-shortcut = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "11"
+
+[dev-dependencies]
+hound = "3.5"
 
 [profile.release]
 codegen-units = 1

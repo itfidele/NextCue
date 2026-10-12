@@ -32,5 +32,7 @@
     "vite": "latest",
     "@tauri-apps/cli": "^2",
     "@playwright/test": "latest"
-  }
+  },
+  "author": "Fidele Kirezi Cyisa",
+  "license": "UNLICENSED"
 }
