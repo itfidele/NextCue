@@ -4,9 +4,9 @@
 
 **CI** runs on pull requests, pushes to `main`/`master`, and manual dispatch. It builds the frontend, runs browser-companion and Playwright UI tests, and runs native Rust tests on macOS, Windows, and Ubuntu 22.04. Integration tests requiring a real AI account or downloaded speech model remain opt-in.
 
-**Package desktop** runs manually or when a `v*` tag is pushed. It checks versions and runs CI before packaging macOS ARM64 and x64 DMGs, a Windows x64 NSIS installer, and Linux x64 AppImage/deb packages. All builds upload `nextcue-*` workflow artifacts with 14-day retention. Linux packages use Ubuntu 22.04 as the build baseline.
+**Package desktop** runs on pushes to `main`, matching `v*` tags, or manual dispatch. It checks versions and runs CI before packaging macOS ARM64 and x64 DMGs, a Windows x64 NSIS installer, and Linux x64 AppImage/deb packages. All builds upload `nextcue-*` workflow artifacts with 14-day retention. Linux packages use Ubuntu 22.04 as the build baseline.
 
-Manual runs only create workflow artifacts. Tag runs collect all installers in one draft GitHub Release after every build succeeds. Rerunning a tag replaces assets only while the release remains a draft. Published release assets are not overwritten by this workflow.
+Pushes to `main`, tag runs, and manual runs from `main` automatically publish a GitHub prerelease for a version that has not been published yet. The workflow creates the version tag at the built commit, uploads all installers to a draft, then publishes only after uploads succeed. Already published versions skip packaging. Existing drafts can be completed on a rerun. Manual runs from other branches only produce artifacts. Published release assets are never overwritten.
 
 ## Prepare a version
 
@@ -24,7 +24,9 @@ npm run build
 npm test
 ```
 
-Commit and push the version and workflow files. Tag that commit with the exact version:
+Commit and push the version and workflow files to `main`. No manual tag or Publish button is needed. The first successful run publishes `v0.1.0`; later releases need a version bump in the files above.
+
+You can also trigger a release explicitly with a matching tag:
 
 ```sh
 # Example for the current version; use a new version for subsequent releases.
@@ -32,7 +34,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow rejects tags that do not match `v` plus the package version. In GitHub Actions, open the packaging run to download artifacts. For a tag run, review the draft under Releases, test every installer on its target platform, and edit release notes before publishing.
+The workflow rejects tags that do not match `v` plus the package version. In GitHub Actions, open the packaging run to download artifacts. On a successful release run, the installers appear publicly under Releases as an early preview. An interrupted upload leaves a draft that a rerun can complete.
 
 ## Signing and distribution
 

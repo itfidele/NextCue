@@ -1,24 +1,46 @@
 name: Package desktop
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: package-${{ github.ref }}
+  group: nextcue-release
   cancel-in-progress: false
 jobs:
   validate:
     runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      build: ${{ steps.plan.outputs.build }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - run: node scripts/check-release-version.mjs
+      - name: Plan release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh release list --limit 1000 --json tagName,isDraft > /tmp/nextcue-releases.json
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const version = JSON.parse(readFileSync('package.json', 'utf8')).version;
+          const tag = `v${version}`;
+          const releases = JSON.parse(readFileSync('/tmp/nextcue-releases.json', 'utf8'));
+          const published = releases.some(release => release.tagName === tag && !release.isDraft);
+          appendFileSync(process.env.GITHUB_OUTPUT, `tag=${tag}\nbuild=${!published}\n`);
+          console.log(published ? `${tag} is already published; skipping packaging.` : `Preparing ${tag}.`);
+          JS
   checks:
     needs: validate
+    if: needs.validate.outputs.build == 'true'
     uses: ./.github/workflows/ci.yml
   build:
     needs: checks
@@ -68,8 +90,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -79,18 +101,20 @@ jobs:
           pattern: nextcue-*
           path: installers
           merge-multiple: true
-      - name: Create draft release and upload installers
+      - name: Publish complete preview release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "NextCue $RELEASE_TAG" --notes 'Desktop preview builds for macOS, Windows, and Linux. These builds are not production signed or notarized. Review provider distribution terms and test the installers before publishing.'
+            gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" --draft --prerelease --title "NextCue $RELEASE_TAG" --notes 'Desktop preview builds for macOS, Windows, and Linux. These builds are not production signed or notarized. Early preview: macOS is ad-hoc signed and not notarized; Windows is unsigned. Connected AI providers require your own eligible account and their terms apply.'
           fi
           if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" != true ]; then
             echo 'Refusing to replace assets on a published release.' >&2
             exit 1
           fi
           find installers -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' \) -print0 | xargs -0 gh release upload "$RELEASE_TAG" --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease

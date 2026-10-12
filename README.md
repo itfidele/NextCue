@@ -115,8 +115,8 @@ npm run package:mac
 ### GitHub CI/CD
 
 - **Pull requests and pushes to `main`/`master`:** frontend build, browser-companion tests, UI tests, and Rust tests on macOS, Windows, and Linux.
-- **Manual packaging:** run **Package desktop** from [GitHub Actions](https://github.com/itfidele/NextCue/actions/workflows/package.yml) to generate downloadable workflow artifacts.
-- **Version tags:** push a matching tag such as `v0.1.0` to run checks, build installers, and attach them to a draft GitHub Release.
+- **Manual packaging:** run **Package desktop** from [GitHub Actions](https://github.com/itfidele/NextCue/actions/workflows/package.yml) to generate downloadable workflow artifacts; runs from `main` also publish an unreleased version.
+- **Automatic releases:** push to `main` with a new app version. After checks and packaging pass, the workflow creates the version tag and publishes a GitHub prerelease with all installers. Matching `v*` tags also trigger this flow.
 
 | Platform | Packaging output |
 | --- | --- |
@@ -124,7 +124,7 @@ npm run package:mac
 | Windows x64 | NSIS installer (`.exe`) |
 | Linux x64 | AppImage and Debian package (`.deb`) |
 
-See the [release guide](docs/RELEASING.md) for versioning, workflow triggers, artifacts, and signing. Generated preview packages are not production signed/notarized; publishing a release is a separate author action.
+See the [release guide](docs/RELEASING.md) for versioning, workflow triggers, artifacts, and signing. Published preview packages are not production signed/notarized. Already published versions are skipped; update the version for your next release.
 
 ## Follow along and share feedback
 

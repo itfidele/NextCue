@@ -618,7 +618,7 @@ test("background preferences persist and asking first waits for an explicit meet
   await expect(page.getByRole("combobox", { name: "When a meeting is triggered", exact: true })).toHaveValue("none");
   await page.getByRole("heading", { name: "Background & meetings", exact: true }).scrollIntoViewIfNeeded();
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-  await page.screenshot({ path: "/private/tmp/nextcue-background-settings.png", animations: "disabled" });
+  await page.screenshot({ path: test.info().outputPath("nextcue-background-settings.png"), animations: "disabled" });
   await page.getByRole("switch", { name: "Start in system tray", exact: true }).click();
   await page.getByRole("switch", { name: "Detect meeting hints", exact: true }).click();
   await page.getByRole("combobox", { name: "When a meeting is triggered", exact: true }).selectOption("prompt");
@@ -663,7 +663,7 @@ test("background preferences persist and asking first waits for an explicit meet
   await expect(page.locator("body")).toContainText("Google Meet");
   await page.getByRole("region", { name: "Meeting detected", exact: true }).scrollIntoViewIfNeeded();
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-  await page.screenshot({ path: "/private/tmp/nextcue-meeting-trigger.png", animations: "disabled" });
+  await page.screenshot({ path: test.info().outputPath("nextcue-meeting-trigger.png"), animations: "disabled" });
   await page.waitForTimeout(200);
   expect(await page.evaluate(() => (window as any).__testStartListeningCalls)).toEqual([]);
   expect(await page.evaluate(() => (window as any).__testRequests)).toEqual([]);
@@ -1047,7 +1047,7 @@ test("stopping audio preserves its final transcript and the source choice", asyn
   expect(settings.audioSource).toBe("system");
   expect(settings.inputDevice).toBe("system");
   await page.screenshot({
-    path: "/private/tmp/nextcue-session.png",
+    path: test.info().outputPath("nextcue-session.png"),
     fullPage: true,
   });
 });
@@ -1426,7 +1426,7 @@ test("custom assistant shortcuts and capture preferences apply and survive reloa
     page.getByLabel("Start meeting shortcut", { exact: true }),
   ).toHaveValue(configured.meetingShortcut);
   await page.screenshot({
-    path: "/private/tmp/nextcue-settings.png",
+    path: test.info().outputPath("nextcue-settings.png"),
     fullPage: true,
   });
   await expect
@@ -1734,7 +1734,7 @@ test("ChatGPT selection persists and sends the chosen model and grounded session
     .selectOption("gpt-test-deep");
   await page.setViewportSize({ width: 1160, height: 780 });
   await page.screenshot({
-    path: "/private/tmp/nextcue-chatgpt-connected.png",
+    path: test.info().outputPath("nextcue-chatgpt-connected.png"),
     fullPage: false,
   });
   await page.getByRole("button", { name: "Home", exact: true }).click();
@@ -1848,7 +1848,7 @@ test("cancelling ChatGPT sign-in restores usable provider controls", async ({
       ),
   );
   await page.screenshot({
-    path: "/private/tmp/nextcue-chatgpt-disconnected.png",
+    path: test.info().outputPath("nextcue-chatgpt-disconnected.png"),
     fullPage: false,
     animations: "disabled",
   });
@@ -2023,11 +2023,18 @@ test("Meeting notes send full source-labelled context and meeting metadata at a 
     context: "Agenda: confirm the release date and next steps.",
   });
   await expect
-    .poll(() => page.evaluate(() => localStorage.getItem("test-state")))
-    .not.toBeNull();
+    .poll(() => page.evaluate(() =>
+      JSON.parse(localStorage.getItem("test-state") || "null")?.sessions?.some(
+        (session: { title: string }) => session.title === "Release planning",
+      ) ?? false,
+    ))
+    .toBe(true);
   await page.evaluate(() => {
     const state = JSON.parse(localStorage.getItem("test-state")!);
-    state.sessions[0].transcript = Array.from({ length: 30 }, (_, i) => ({
+    const session = state.sessions.find(
+      (session: { title: string }) => session.title === "Release planning",
+    );
+    session.transcript = Array.from({ length: 30 }, (_, i) => ({
       id: String(i),
       text: `Release discussion ${i}`,
       source: i === 0 ? "system" : "microphone",
@@ -2063,7 +2070,7 @@ test("Meeting notes send full source-labelled context and meeting metadata at a 
   expect(request.transcript).toContain("Microphone: Release discussion 29");
   expect(request.instructions).not.toContain("STAR");
   await page.screenshot({
-    path: "/private/tmp/nextcue-meeting-notes.png",
+    path: test.info().outputPath("nextcue-meeting-notes.png"),
     fullPage: false,
   });
 });
