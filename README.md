@@ -1,14 +1,40 @@
-# NextCue
+<p align="center">
+  <img src="public/logo.svg" width="88" alt="NextCue logo" />
+</p>
 
-**Your desktop companion for conversations, meeting notes, interview practice, and learning from videos.**
+<h1 align="center">NextCue</h1>
+<p align="center"><strong>A little help, on cue.</strong><br />Prepare for conversations. Capture what matters. Keep your next thought within reach.</p>
 
-NextCue transcribes audio you choose locally and helps turn conversations into useful answers and notes. Use local AI through Ollama, or connect a supported ChatGPT or Claude account. A floating assistant keeps your current session within reach while you work.
+<p align="center">
+  <a href="https://github.com/itfidele/NextCue/actions/workflows/ci.yml"><img src="https://github.com/itfidele/NextCue/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
+  <a href="https://github.com/itfidele/NextCue/actions/workflows/package.yml"><img src="https://github.com/itfidele/NextCue/actions/workflows/package.yml/badge.svg" alt="Desktop packaging status" /></a>
+  <img src="https://img.shields.io/badge/status-early%20preview-7c6cf2" alt="Early preview" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-proprietary-555" alt="Proprietary license" /></a>
+</p>
 
-Created by **Fidele Kirezi Cyisa**. NextCue is an early desktop product under active development, built with Tauri, Rust, React, and TypeScript.
+<p align="center">
+  <a href="#why-nextcue">Why NextCue</a> ·
+  <a href="#see-it-in-action">Screenshots</a> ·
+  <a href="#get-started">Get started</a> ·
+  <a href="docs/USER_GUIDE.md">User guide</a> ·
+  <a href="https://github.com/itfidele/NextCue/issues">Feedback</a>
+</p>
 
-![NextCue Home](docs/screenshots/home.png)
+NextCue is a desktop AI companion for interview preparation, meeting notes, and learning from videos. It turns the audio you choose into a local transcript, then helps you find useful answers or pull out the important points. Keep it beside your work as a floating assistant, or return to your saved sessions later.
 
-## What it does
+![NextCue Home — choose a conversation, practice session, meeting, or video](docs/screenshots/home.png)
+
+## Why NextCue?
+
+**Go into your next conversation prepared.** Practice questions with suggestions grounded in the role, experience, and background you provide.
+
+**Leave a meeting with something useful.** Turn captured speech into decisions, action items, and open questions you can revisit.
+
+**Make video learning easier to review.** Capture browser video audio, generate study notes, and export subtitles for later use.
+
+**Choose how your AI runs.** Ollama answers and Whisper transcription can run locally. Supported ChatGPT and Claude accounts are optional answer providers.
+
+## Find your workflow
 
 | Workflow | Features |
 | --- | --- |
@@ -19,7 +45,9 @@ Created by **Fidele Kirezi Cyisa**. NextCue is an early desktop product under ac
 | Session library | Review saved transcripts and answers, create recaps, and export Markdown. |
 | Background work | Keep sessions running through the tray; optionally enable meeting hints or pair the browser companion. |
 
-### Create a session
+## See it in action
+
+### Give your session a purpose
 
 Choose Interview, Practice, Meeting, or Video and supply context to guide the assistant.
 
@@ -33,7 +61,11 @@ Ollama is the default answer provider. Whisper transcribes speech locally. Setti
 
 These screenshots show the actual web preview with sample session fields. Native audio, AI connections, and local file storage require the desktop app.
 
-## Run locally
+## Get started
+
+**Early preview:** run NextCue from source today. Packaged preview builds will be available through [GitHub Releases](https://github.com/itfidele/NextCue/releases) when the author publishes them.
+
+### Run the desktop app
 
 Install Node.js/npm, Rust, and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/). For local answers, install [Ollama](https://ollama.com/) and download a model:
 
@@ -63,7 +95,7 @@ macOS is the current development platform. Windows/Linux native behavior and liv
 
 See the [full setup and usage guide](docs/USER_GUIDE.md) for account setup, shortcuts, permissions, exports, and platform limits, and the [browser companion guide](browser-extension/README.md) for optional pairing.
 
-## Build and verify
+## Development and desktop packaging
 
 ```sh
 npm run build
@@ -80,7 +112,25 @@ npm run package:mac
 # Linux: npm run package:linux
 ```
 
-Distribution requires appropriate platform signing/notarization.
+### GitHub CI/CD
+
+- **Pull requests and pushes to `main`/`master`:** frontend build, browser-companion tests, UI tests, and Rust tests on macOS, Windows, and Linux.
+- **Manual packaging:** run **Package desktop** from [GitHub Actions](https://github.com/itfidele/NextCue/actions/workflows/package.yml) to generate downloadable workflow artifacts.
+- **Version tags:** push a matching tag such as `v0.1.0` to run checks, build installers, and attach them to a draft GitHub Release.
+
+| Platform | Packaging output |
+| --- | --- |
+| macOS Apple Silicon / Intel | DMG for each architecture |
+| Windows x64 | NSIS installer (`.exe`) |
+| Linux x64 | AppImage and Debian package (`.deb`) |
+
+See the [release guide](docs/RELEASING.md) for versioning, workflow triggers, artifacts, and signing. Generated preview packages are not production signed/notarized; publishing a release is a separate author action.
+
+## Follow along and share feedback
+
+If NextCue interests you, **star the repository** to bookmark it and **watch releases** for updates. Have a workflow you would like it to support? [Open a feature request](https://github.com/itfidele/NextCue/issues/new). For a bug, include your operating system, app version, and steps to reproduce; remove private transcript or account information.
+
+NextCue is created by **Fidele Kirezi Cyisa**. Feedback is welcome; reuse of the source requires permission under the license below.
 
 ## Ownership and license
 

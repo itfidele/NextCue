@@ -1,0 +1,37 @@
+name: Set up NextCue desktop build
+description: Install Node, Rust, and native audio/webview build dependencies.
+inputs:
+  target:
+    description: Optional Rust compilation target
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: npm
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+    - name: Linux native dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake clang libclang-dev libasound2-dev libssl-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2 xdg-utils file
+    - name: Windows libclang
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $llvmDirectory = 'C:\Program Files\LLVM\bin'
+        if (-not (Test-Path "$llvmDirectory\libclang.dll")) {
+          choco install llvm --yes --no-progress
+        }
+        "LIBCLANG_PATH=$llvmDirectory" >> $env:GITHUB_ENV
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: src-tauri -> target
+        key: ${{ inputs.target }}
+    - shell: bash
+      run: npm ci
