@@ -51,3 +51,7 @@ Enable GitHub Actions. Release creation uses the built-in `GITHUB_TOKEN` with `c
 Make the frontend and native CI checks required in branch protection if you want GitHub to enforce them before merging. Workflow files do not configure branch protection automatically.
 
 The pipeline follows [Tauri's GitHub packaging guidance](https://v2.tauri.app/distribute/pipelines/github/). GitHub-hosted runs are the cross-platform verification step; a local macOS check cannot validate Windows or Linux installers.
+
+## Windows test startup
+
+Windows CI uses `scripts/test-windows.ps1` to compile Cargo test executables, embed a Common Controls v6 manifest with the installed Windows SDK `mt.exe`, then run the standard Cargo test suite. The separate Cargo library-test harness needs this manifest because it links Tauri UI libraries; the packaged application already receives its own manifest from Tauri. This addresses the likely cause of `0xc0000139` (`STATUS_ENTRYPOINT_NOT_FOUND`) before tests start. The next Windows run must confirm it; the error code alone does not identify the missing DLL entry point.
